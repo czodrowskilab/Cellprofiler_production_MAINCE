@@ -26,68 +26,230 @@ const RED_COUNTS     = Q.redCounts;
 // Comes from config.ROBUST_METRICS via the payload — single source of truth.
 const ROBUST_PREFIXES = Q.robustMetrics || ['ImageQuality_MedianIntensity_'];
 
-// ── Color resolver ÚNICO (espejo de qc/stats/colors.py ColorResolver) ────────
-// Una sola regla de color para métricas QC, compartida por platemaps, Plate
-// Browser, paneles de well/sitio y bordes de verdict. Antes había tres copias
-// divergentes (specColor continuo sobre valor crudo) que se desincronizaban del
-// platemap (bandas de |z| para métricas robustas). Esta es la autoridad única.
+// ── Colour resolver and QC engine ────────────────────────────────────────────
+// One colour rule for every QC metric, shared by the platemaps, Plate Browser, well/site
+// panels and verdict borders, driven by the live thresholds (see the engine below).
 //
-//   · robustas (Slope, MedInt)  → color por |z_cohorte| en bandas discretas.
-//   · PercentMaximal            → color por valor crudo contra cortes absolutos.
-//   · Ratio_P10/P90             → color por valor crudo contra cortes absolutos
-//                                  (ALTO = malo: p10 ≈ p90 → campo casi todo fondo).
+//   · Blur / MedianIntensity → robust z-score of each site against same-perturbation
+//     wells (plate z and cohort z); colour from max(|z_pl|, |z_co|) vs warning/fail.
+//   · PercentMaximal         → raw value vs absolute warning/fail cuts.
+//   · Ratio_P10/P90          → raw value vs absolute warning/fail cuts
+//                              (HIGH = bad: p10 ≈ p90 → field is mostly background).
 //
-// La especificación (modo, cortes, colores, refs de cohorte) viene de Q.colorSpec,
-// generada en Python, así front y back aplican EXACTAMENTE la misma regla.
+// A well takes the colour of its worst site. Default thresholds, reference statistics
+// and the colour palette come from the Python payload (qc/stats/thresholds.py), so the
+// browser and the pipeline apply the same rules.
 
 const COLOR_SPEC = Q.colorSpec || {
   robustPrefixes: ROBUST_PREFIXES,
-  zband: { greenMax: 1.0, amberMax: 3.0 },
-  absolute: { 'ImageQuality_PercentMaximal_': { lo: 0.1, hi: 1.0 },
-              'Ratio_P10/P90': { lo: 0.4, hi: 0.5 }  },
   colors: { green: '#4bd760', amber: '#ffbe00', red: '#ff4444' },
 };
 const CLR = COLOR_SPEC.colors;
 
+// ── Live thresholds, criteria and the site-level QC engine ───────────────────
+// Single rule set for the whole report. Python ships (a) the default thresholds,
+// (b) per-perturbation reference statistics (median, MAD, n) for the robust
+// metrics, and (c) the per-site values. Everything that classifies a site or a
+// well — heatmap colours, plate-overview borders, the cohort summary counts and
+// the failed-sites download — is computed here from those three inputs, so a
+// threshold edited in the UI changes all of them consistently.
+//
+// Rules (mirrors qc/stats/site_flags.py; see qc/stats/thresholds.py):
+//   Blur / MedianIntensity  robust z = (x - median) / MAD against same-perturbation
+//                           sites, once within the plate (z_pl) and once across the
+//                           cohort (z_co). A site's score is max(|z_pl|, |z_co|).
+//   Debris                  PercentMaximal (per channel) > fail
+//   Low cell density        Ratio_P10/P90 > fail
+//   Cells/Nuclei ratio      Count_Cells / Count_Nuclei < min
+//   Cell count              site: Count_Cells < min per site
+//                           well: summed Count_Cells < min per well
+// A well fails when any of its sites fails (or it breaks a well-level rule).
+const TH_SPEC     = Q.thresholds;
+const TH_DEFAULTS = TH_SPEC.defaults;
+const TH          = Object.assign({}, TH_DEFAULTS);        // live values
+const SITE_REFS   = Q.siteRefs || { cohort: {}, plate: {} };
+const activeCriteria = new Set(TH_SPEC.criteria.map(c => c.key));  // all active
+
+const ROBUST_DEFS = [
+  { crit: 'slope',  prefix: 'ImageQuality_PowerLogLogSlope_', failKey: 'blur_z_fail',   warnKey: 'blur_z_warn'   },
+  { crit: 'medint', prefix: 'ImageQuality_MedianIntensity_',  failKey: 'medint_z_fail', warnKey: 'medint_z_warn' },
+];
+// Criterion name (prefix before ':') → verdict family (checkbox value).
+const CRIT_FAMILY = {
+  slope: 'slope', medint: 'medint', pctmax: 'debris', 'Ratio_P10/P90': 'ldens',
+  cells_nuclei_ratio: 'ratio', low_cell_count: 'cells', low_cell_count_well: 'cells',
+};
+const FAMILIES = ['slope', 'medint', 'debris', 'ldens', 'ratio', 'cells'];
+const CH_LIST  = SLOPE_SPECS.map(s => s.col.split('_').pop());
+
+function _critFamily(crit) { return CRIT_FAMILY[crit.split(':')[0]]; }
+function _isNum(v)         { return v != null && typeof v === 'number' && !isNaN(v); }
+function _robustDef(col)   { return ROBUST_DEFS.find(d => col.startsWith(d.prefix)) || null; }
+function _cmpdOf(plate, well) { return ((DATA[plate].wells || {})[well] || {}).compound || ''; }
 function _colorMode(col) {
   if (COLOR_SPEC.robustPrefixes.some(p => col.startsWith(p))) return 'zband';
   return 'absolute';
 }
+// Warning/fail cuts of the absolute (value-based) metrics, from the live thresholds.
 function _absoluteCuts(col) {
-  for (const prefix of Object.keys(COLOR_SPEC.absolute)) {
-    if (col.startsWith(prefix)) return COLOR_SPEC.absolute[prefix];
-  }
+  if (col.startsWith('ImageQuality_PercentMaximal_')) return { lo: TH.pctmax_warn, hi: TH.pctmax_fail };
+  if (col === 'Ratio_P10/P90')                         return { lo: TH.p1090_warn, hi: TH.p1090_fail };
   return null;
 }
-// Cohort z (z_co) de un well para una columna robusta; null si no hay.
-function _zco(col, plateName, well) {
-  const sc = (MAD_SCORES[col] || {})[plateName]?.[well];
-  return sc && sc.z_co != null ? sc.z_co : null;
+
+// Robust z of ONE site value against the same-perturbation references.
+// z does not depend on the thresholds, so results can be cached for good.
+function siteZ(plate, cmpd, col, v) {
+  if (!_isNum(v)) return { zpl: null, zco: null, eff: null };
+  const rc = (SITE_REFS.cohort[cmpd] || {})[col];
+  const rp = ((SITE_REFS.plate[plate] || {})[cmpd] || {})[col];
+  const zco = rc ? (v - rc[0]) / rc[1] : null;
+  const zpl = rp ? (v - rp[0]) / rp[1] : null;
+  const abs = [zco, zpl].filter(z => z != null).map(Math.abs);
+  return { zpl, zco, eff: abs.length ? Math.max(...abs) : null };
 }
-// Color de UN valor.
-//   zband        → por |z_co| (ignora value).
-//   absolute     → ALTO = malo: verde <lo, ambar lo..hi, rojo >hi.
-function colorForValue(col, value, zco) {
-  const mode = _colorMode(col);
-  if (mode === 'zband') {
-    if (zco == null) return null;
-    const az = Math.abs(zco);
-    if (az <= COLOR_SPEC.zband.greenMax) return CLR.green;
-    if (az <= COLOR_SPEC.zband.amberMax) return CLR.amber;
-    return CLR.red;
-  }
-  if (value == null || (typeof value === 'number' && isNaN(value))) return null;
+const _worstZCache = new Map();
+// Worst site (largest effective |z|) of a well for one robust column.
+function wellWorstZ(plate, well, col) {
+  const key = plate + '|' + well + '|' + col;
+  if (_worstZCache.has(key)) return _worstZCache.get(key);
+  const sites = (DATA[plate].site_data || {})[well] || {};
+  const cmpd  = _cmpdOf(plate, well);
+  let best = null;
+  Object.keys(sites).forEach(f => {
+    const z = siteZ(plate, cmpd, col, sites[f][col]);
+    if (z.eff != null && (best == null || z.eff > best.eff)) best = Object.assign({ field: f }, z);
+  });
+  _worstZCache.set(key, best);
+  return best;
+}
+
+function _zBand(eff, def) {
+  if (eff == null) return null;
+  if (eff > TH[def.failKey]) return CLR.red;
+  if (eff > TH[def.warnKey]) return CLR.amber;
+  return CLR.green;
+}
+function _absBand(col, v) {
+  if (!_isNum(v)) return null;
   const cuts = _absoluteCuts(col);
   if (!cuts) return null;
-  if (value < cuts.lo) return CLR.green;
-  if (value <= cuts.hi) return CLR.amber;
-  return CLR.red;
+  if (v > cuts.hi) return CLR.red;
+  if (v >= cuts.lo) return CLR.amber;
+  return CLR.green;
 }
-// Resuelve el color de un spec para un well concreto (usa z_co del cohorte).
-function resolveColor(spec, value, plateName, well) {
-  const zco = _colorMode(spec.col) === 'zband' ? _zco(spec.col, plateName, well) : null;
-  return colorForValue(spec.col, value, zco);
+// Colour of a metric spec for a well (worst site) or, with `field`, for one site.
+function resolveColor(spec, value, plateName, well, field) {
+  const def = _robustDef(spec.col);
+  if (def) {
+    if (!DATA[plateName] || well == null) return null;   // robust colour needs plate + well
+    if (field != null) {
+      const sv = ((DATA[plateName].site_data || {})[well] || {})[String(field)] || {};
+      return _zBand(siteZ(plateName, _cmpdOf(plateName, well), spec.col, sv[spec.col]).eff, def);
+    }
+    const w = wellWorstZ(plateName, well, spec.col);
+    return w ? _zBand(w.eff, def) : null;
+  }
+  return _absBand(spec.col, value);
 }
+
+// ── Classification ───────────────────────────────────────────────────────────
+function siteFailures(plate, cmpd, sv) {
+  const out = [];
+  ROBUST_DEFS.forEach(def => CH_LIST.forEach(ch => {
+    const col = def.prefix + ch;
+    const z = siteZ(plate, cmpd, col, sv[col]);
+    if (z.eff != null && z.eff > TH[def.failKey]) out.push(`${def.crit}:${ch}`);
+  }));
+  CH_LIST.forEach(ch => {
+    const v = sv['ImageQuality_PercentMaximal_' + ch];
+    if (_isNum(v) && v > TH.pctmax_fail) out.push('pctmax:' + ch);
+  });
+  const r = sv['Ratio_P10/P90'];
+  if (_isNum(r) && r > TH.p1090_fail) out.push('Ratio_P10/P90');
+  const cells = sv['Count_Cells'], nuc = sv['Count_Nuclei'];
+  if (_isNum(cells) && _isNum(nuc) && nuc > 0 && cells / nuc < TH.ratio_min) out.push('cells_nuclei_ratio');
+  if (_isNum(cells) && cells < TH.cells_site_min) out.push('low_cell_count');
+  return out;
+}
+function wellFailures(sites) {
+  let tot = 0, n = 0;
+  Object.values(sites).forEach(sv => { if (_isNum(sv['Count_Cells'])) { tot += sv['Count_Cells']; n++; } });
+  return (n > 0 && tot < TH.cells_well_min) ? ['low_cell_count_well'] : [];
+}
+const _evalCache = new Map();
+function invalidateEval() { _evalCache.clear(); }
+// {cmpd, siteFails:{field:[crit]}, wellFails:[crit], fams:Set} — independent of the
+// active-criteria toggles (those are applied by activeFailuresOf).
+function getEval(plate, well) {
+  const key = plate + '|' + well;
+  let e = _evalCache.get(key);
+  if (e) return e;
+  const sites = (DATA[plate].site_data || {})[well] || {};
+  const cmpd  = _cmpdOf(plate, well);
+  const siteFails = {}, fams = new Set();
+  Object.keys(sites).forEach(f => {
+    const list = siteFailures(plate, cmpd, sites[f]);
+    if (list.length) siteFails[f] = list;
+    list.forEach(c => fams.add(_critFamily(c)));
+  });
+  const wf = wellFailures(sites);
+  wf.forEach(c => fams.add(_critFamily(c)));
+  e = { cmpd, siteFails, wellFails: wf, fams };
+  _evalCache.set(key, e);
+  return e;
+}
+function activeFailuresOf(list) { return list.filter(c => activeCriteria.has(_critFamily(c))); }
+
+function _wellSort(a, b) {
+  return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : parseInt(a.slice(1)) - parseInt(b.slice(1));
+}
+// Every failed plate-well-site under the active criteria and the live thresholds.
+function failedSiteRows() {
+  const rows = [];
+  PLATES.forEach(plate => {
+    const sd = DATA[plate].site_data || {};
+    Object.keys(sd).sort(_wellSort).forEach(well => {
+      const e = getEval(plate, well);
+      Object.keys(sd[well]).sort((a, b) => a - b).forEach(f => {
+        const crit = activeFailuresOf((e.siteFails[f] || []).concat(e.wellFails));
+        if (crit.length) rows.push({ plate, well, site: Number(f), cmpd: e.cmpd, criteria: crit });
+      });
+    });
+  });
+  return rows;
+}
+// Per-plate well counts by family (independent of toggles) + 'any' (active only).
+function plateCounts(plate) {
+  const c = { slope: 0, medint: 0, debris: 0, ldens: 0, ratio: 0, cells: 0, any: 0 };
+  Object.keys(DATA[plate].site_data || {}).forEach(well => {
+    const e = getEval(plate, well);
+    FAMILIES.forEach(f => { if (e.fams.has(f)) c[f]++; });
+    const all = Object.values(e.siteFails).flat().concat(e.wellFails);
+    if (activeFailuresOf(all).length) c.any++;
+  });
+  return c;
+}
+
+// ── Verdict colour (overview borders, montage tiles) ─────────────────────────
+// Worst colour among the ACTIVE families. Ratio / cell-count have no colour
+// scale, so they only contribute red when they fail.
+function verdictColorWell(plate, well) {
+  const m = (DATA[plate].wells || {})[well] || {};
+  const colors = verdictSpecs().map(spec => resolveColor(spec, m[spec.col], plate, well)).filter(Boolean);
+  const e = getEval(plate, well);
+  ['ratio', 'cells'].forEach(f => { if (activeCriteria.has(f) && e.fams.has(f)) colors.push(CLR.red); });
+  return worstColorOf(colors);
+}
+function verdictColorSite(plate, well, field) {
+  const sv = ((DATA[plate].site_data || {})[well] || {})[String(field)] || {};
+  const colors = verdictSpecs().map(spec => resolveColor(spec, sv[spec.col], plate, well, field)).filter(Boolean);
+  const e = getEval(plate, well);
+  const own = activeFailuresOf((e.siteFails[field] || []).concat(e.wellFails));
+  if (own.some(c => ['ratio', 'cells'].includes(_critFamily(c)))) colors.push(CLR.red);
+  return worstColorOf(colors);
+}
+
 const COLOR_ORDER = [CLR.red, CLR.amber, CLR.green];
 function worstColorOf(colors) {
   const present = new Set(colors.filter(Boolean));
@@ -97,7 +259,7 @@ function worstColorOf(colors) {
 const METRIC_GROUPS = [
   { label: 'Blur (PowerLogLogSlope)',        specs: SLOPE_SPECS   },
   { label: 'Debris (PercentMaximal)',   specs: DEBRIS_SPECS  }  ,
-  { label: 'Low density (Ratio_P10/P90)',    specs: L_DENS_SPECS    },
+  { label: 'Low cell density (Ratio_P10/P90)',    specs: L_DENS_SPECS    },
   { label: 'MedianIntensity', specs: MEDIANINT_SPECS },
 ];
  
@@ -139,8 +301,10 @@ function arrMedian(arr) {
 }
 
 // ── 1. Summary ────────────────────────────────────────────────────────────────
-(function() {
+const _mfiCellCache = {};     // O2B / ANOVA cells do not depend on thresholds
+function renderSummary() {
   const tbody = document.getElementById('summary-tbody');
+  tbody.innerHTML = '';
   PLATES.forEach(p => {
     const d = DATA[p];
     // Compute median MFI Δ for Hoechst/DNA and Syto across wells
@@ -241,34 +405,23 @@ function arrMedian(arr) {
       return `<td style="text-align:center;">${content}</td>`;
     };
 
+    if (!_mfiCellCache[p]) _mfiCellCache[p] = { snr: snrSummary(), pos: positionalSummary() };
+    const c = plateCounts(p);
+    const cnt = n => n > 0
+      ? `<span style="color:#ff4444;font-weight:700;">${n}</span>`
+      : `<span style="color:#4bd760;">0</span>`;
+    const td = n => `<td style="text-align:center;font-family:monospace;">${cnt(n)}</td>`;
     tbody.insertAdjacentHTML('beforeend', `<tr>
       <td><strong>${p}</strong></td><td>${d.n_wells}</td>
-      <td style="text-align:center;font-family:monospace;">
-        ${(RED_COUNTS.slope[p]||0) > 0
-            ? `<span style="color:#ff4444;font-weight:700;">${RED_COUNTS.slope[p]}</span>`
-            : `<span style="color:#4bd760;">0</span>`}
-      </td>
-      <td style="text-align:center;font-family:monospace;">
-        ${(RED_COUNTS.debris[p]||0) > 0
-            ? `<span style="color:#ff4444;font-weight:700;">${RED_COUNTS.debris[p]}</span>`
-            : `<span style="color:#4bd760;">0</span>`}
-      </td>
-      <td style="text-align:center;font-family:monospace;">
-        ${(RED_COUNTS.low_density[p]||0) > 0
-            ? `<span style="color:#ff4444;font-weight:700;">${RED_COUNTS.low_density[p]}</span>`
-            : `<span style="color:#4bd760;">0</span>`}
-      </td>
-      <td style="text-align:center;font-family:monospace;">
-        ${(RED_COUNTS.medint[p]||0) > 0
-            ? `<span style="color:#ff4444;font-weight:700;">${RED_COUNTS.medint[p]}</span>`
-            : `<span style="color:#4bd760;">0</span>`}
-      </td>
-      ${snrSummary()}
-      ${positionalSummary()}
+      ${td(c.any)}${td(c.slope)}${td(c.debris)}${td(c.ldens)}${td(c.medint)}${td(c.ratio)}${td(c.cells)}
+      ${_mfiCellCache[p].snr}
+      ${_mfiCellCache[p].pos}
     </tr>`);
   });
-})();
- 
+  updateFailedSummary();
+}
+renderSummary();
+
 // ── 2. Plate browser ──────────────────────────────────────────────────────────
 const slider   = document.getElementById('plate-slider');
 const pSelect  = document.getElementById('plate-select');
@@ -313,8 +466,8 @@ function renderPlate(idx) {
 // specColor / worstColor quedan como envoltorios finos del resolver único, para
 // no duplicar la regla. specColor necesita plateName+well porque las métricas
 // robustas se colorean por z_co (no por valor crudo).
-function specColor(v, spec, plateName, well) {
-  return resolveColor(spec, v, plateName, well);
+function specColor(v, spec, plateName, well, field) {
+  return resolveColor(spec, v, plateName, well, field);
 }
 function worstColor(colors) { return worstColorOf(colors); }
 
@@ -335,11 +488,8 @@ function buildOverlaySVG(plateName) {
       const m    = pd.wells[well] || {};
       const x0   = ci * cw, y0 = ri * ch;
 
-      // Peor color entre las métricas ACTIVAS (según los toggles de criterios).
-      const colors = verdictSpecs()
-        .map(spec => specColor(m[spec.col], spec, plateName, well))
-        .filter(Boolean);
-      const border = worstColor(colors);
+      // Worst colour among the ACTIVE criteria at the live thresholds.
+      const border = verdictColorWell(plateName, well);
 
       const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
       rect.setAttribute('class', 'well-cell');
@@ -347,11 +497,10 @@ function buildOverlaySVG(plateName) {
       rect.setAttribute('x', x0 + 1); rect.setAttribute('y', y0 + 1);
       rect.setAttribute('width', cw - 2); rect.setAttribute('height', ch - 2);
       rect.setAttribute('data-well', well);
-      if (border) {
-        rect.setAttribute('stroke', border);
-        rect.setAttribute('stroke-width', '3');
-        rect.setAttribute('fill', border + '18');  // 18 = ~10% opacity
-      }
+      // Always draw a stroke: the PNG underneath has a border baked in with the
+      // DEFAULT thresholds, which must not show through when the live verdict differs.
+      rect.setAttribute('stroke', border || '#282d46');
+      rect.setAttribute('stroke-width', '3');
       rect.onclick = () => selectWell(plateName, well);
       svg.appendChild(rect);
     });
@@ -469,7 +618,6 @@ const ALL_METRIC_SPECS = [...SLOPE_SPECS, ...DEBRIS_SPECS,
 // per-metric detail tables still list every metric.
 const VERDICT_FAMILIES = { slope: SLOPE_SPECS, debris: DEBRIS_SPECS,
                            ldens: L_DENS_SPECS, medint: MEDIANINT_SPECS };
-const activeCriteria = new Set(Object.keys(VERDICT_FAMILIES));  // all active
 
 // Specs used to compute a well/site verdict, honouring the active toggles.
 function verdictSpecs() {
@@ -504,6 +652,7 @@ function renderWellInfo(plateName, well) {
     if (v == null) return;
     html += metricRowHTML(spec, v, plateName, well, worst[spec.col]);
   });
+  html += failBlockHTML(plateName, well, null);
 
   document.getElementById('well-info').innerHTML = html;
 }
@@ -513,21 +662,35 @@ function renderWellInfo(plateName, well) {
 //   · percentiles→ valor + sitio responsable del peor valor (si no es verde).
 // worstField: sitio responsable (solo aplica a percentiles a nivel WELL; en el
 // panel de sitio se pasa null porque el valor ya es el del sitio mostrado).
-function metricRowHTML(spec, v, plateName, well, worstField) {
-  const color = resolveColor(spec, v, plateName, well) || 'var(--muted)';
+function metricRowHTML(spec, v, plateName, well, worstField, field) {
+  const color = resolveColor(spec, v, plateName, well, field) || 'var(--muted)';
   let extra = '';
   if (_colorMode(spec.col) === 'zband') {
-    const sc = (MAD_SCORES[spec.col] || {})[plateName]?.[well];
-    if (sc && (sc.z_pl != null || sc.z_co != null)) {
-      const zpl = sc.z_pl != null ? `${sc.z_pl >= 0 ? '+' : ''}${sc.z_pl}` : '—';
-      const zco = sc.z_co != null ? `${sc.z_co >= 0 ? '+' : ''}${sc.z_co}` : '—';
-      extra = `<span class="metric-z" title="MAD z-score vs placa y vs cohorte">`
-            + `<span class="metric-z-line">z<sub>pl</sub> ${zpl}</span>`
-            + `<span class="metric-z-line">z<sub>co</sub> ${zco}</span></span>`;
+    // Robust metrics: z-scores against same-perturbation wells. Well panel → worst
+    // site; site panel → that site.
+    let z, site = null;
+    if (field != null) {
+      const sv = ((DATA[plateName].site_data || {})[well] || {})[String(field)] || {};
+      z = siteZ(plateName, _cmpdOf(plateName, well), spec.col, sv[spec.col]);
+    } else {
+      z = wellWorstZ(plateName, well, spec.col);
+      site = z ? z.field : null;
+    }
+    const f = x => x == null ? '—' : `${x >= 0 ? '+' : ''}${x.toFixed(2)}`;
+    if (z && z.eff != null) {
+      extra = `<span class="metric-z" title="Robust z-score vs same-perturbation wells (plate / cohort)`
+            + `${site != null ? '; worst site shown' : ''}">`
+            + `<span class="metric-z-line">z<sub>pl</sub> ${f(z.zpl)}</span>`
+            + `<span class="metric-z-line">z<sub>co</sub> ${f(z.zco)}</span>`
+            + (site != null ? `<span class="metric-z-line">site ${site}</span>` : '')
+            + `</span>`;
+    } else {
+      extra = `<span class="metric-z" title="No same-perturbation reference group with enough sites">`
+            + `<span class="metric-z-line">z n/a</span></span>`;
     }
   } else if (worstField != null && color !== CLR.green) {
-    // Sitio culpable del peor valor, para dirigir la búsqueda de outliers.
-    extra = `<span class="metric-site" title="Sitio responsable del peor valor">`
+    // Site responsible for the worst value, to direct the outlier search.
+    extra = `<span class="metric-site" title="Site responsible for the worst value">`
           + `site ${worstField}</span>`;
   }
   return `<div class="metric-row">
@@ -537,6 +700,26 @@ function metricRowHTML(spec, v, plateName, well, worstField) {
         ${extra}
       </span>
     </div>`;
+}
+
+// Failed-criteria box for the well panel (field == null) or a site panel.
+function failBlockHTML(plateName, well, field) {
+  const e = getEval(plateName, well);
+  const items = [];
+  if (field != null) {
+    activeFailuresOf((e.siteFails[field] || []).concat(e.wellFails)).forEach(c => items.push(c));
+  } else {
+    const bySite = {};
+    Object.keys(e.siteFails).sort((a, b) => a - b).forEach(f =>
+      activeFailuresOf(e.siteFails[f]).forEach(c => (bySite[c] = bySite[c] || []).push(f)));
+    Object.keys(bySite).forEach(c => items.push(
+      `${c} <span style="color:#d08080">(site${bySite[c].length > 1 ? 's' : ''} ${bySite[c].join(', ')})</span>`));
+    activeFailuresOf(e.wellFails).forEach(c =>
+      items.push(`${c} <span style="color:#d08080">(whole well)</span>`));
+  }
+  if (!items.length) return '<div class="pass-block">Passes all active criteria</div>';
+  return `<div class="fail-block"><div class="fail-title">Failed criteria</div>`
+       + items.map(i => `<div class="fail-item">${i}</div>`).join('') + `</div>`;
 }
  
 function renderWellMontage(plateName, well) {
@@ -550,7 +733,7 @@ function renderWellMontage(plateName, well) {
     const flags = pd.well_flags[well];
     el.innerHTML = flags
       ? '<span class="no-img">Flagged well — montage not pre-generated.</span>'
-      : '<span class="no-img">Well passes all QC thresholds — no image preloaded.</span>';
+      : '<span class="no-img">No montage embedded: only wells flagged under the default thresholds carry one.</span>';
     return;
   }
 
@@ -572,16 +755,8 @@ function renderWellMontage(plateName, well) {
     const hasData = Object.prototype.hasOwnProperty.call(siteData, String(s));
 
     // Peor color entre las métricas ACTIVAS del sitio (según los toggles).
-    let border = null;
-    if (hasData) {
-      const m = siteData[String(s)];
-      // Percentiles: color por el valor DEL SITIO (unidad de detección).
-      // Robustas: no hay z por sitio; heredan el z_co del well.
-      const colors = verdictSpecs()
-        .map(spec => specColor(m[spec.col], spec, plateName, well))
-        .filter(Boolean);
-      border = worstColor(colors);
-    }
+    // Every metric is judged on the SITE's own values (robust ones by the site's z-score).
+    const border = hasData ? verdictColorSite(plateName, well, s) : null;
 
     const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
     rect.setAttribute('class', 'site-cell' + (hasData ? '' : ' site-empty'));
@@ -640,11 +815,10 @@ function renderSiteInfo(plateName, well, site) {
   ALL_METRIC_SPECS.forEach(spec => {
     const v = m[spec.col];
     if (v == null) return;
-    // A nivel de sitio el valor mostrado ya es el del sitio; el color de las
-    // robustas hereda el z_co del well (no hay z por sitio). Sin "site N" porque
-    // este panel ya ES un sitio concreto.
-    html += metricRowHTML(spec, v, plateName, well, null);
+    // Site level: the value and the robust z-scores are the site's own.
+    html += metricRowHTML(spec, v, plateName, well, null, site);
   });
+  html += failBlockHTML(plateName, well, String(site));
 
   document.getElementById('site-info').innerHTML = html;
   _drawSiteCrop(plateName, well, site);
@@ -780,13 +954,15 @@ function renderQCSiteTable(plateName, well) {
     // spec del canal activo dentro de este grupo de métrica
     const spec = def.specs.find(s => s.col.endsWith('_' + ch));
     const col  = spec ? spec.col : null;
-    const fmtCell = v => {
+    // field = site id for a site column (robust metrics are coloured by that site's z-score);
+    // null for the Well column (worst site).
+    const fmtCell = (v, field) => {
       if (v == null) return '<span class="site-na">—</span>';
-      const color = spec ? specColor(v, spec) : null;
+      const color = spec ? specColor(v, spec, plateName, well, field) : null;
       return `<span style="color:${color || 'var(--text)'}">${fmt3(v)}</span>`;
     };
-    const cells = SITE_IDS.map(s => fmtCell(col ? _siteVal(plateName, well, s, col) : undefined));
-    cells.push(fmtCell(col ? _wellVal(plateName, well, col) : undefined));  // agregado por well
+    const cells = SITE_IDS.map(s => fmtCell(col ? _siteVal(plateName, well, s, col) : undefined, s));
+    cells.push(fmtCell(col ? _wellVal(plateName, well, col) : undefined, null));  // well aggregate
     return { label: def.label, cells };
   });
 
@@ -811,10 +987,16 @@ function renderCountsSiteTable(plateName, well) {
     ['Raw nuclei', 'Count_Raw_nuclei'],
     ['Artifacts',  'Count_Illum_artifacts_filtered'],
   ];
-  const fmtCount = v => v == null ? '<span class="site-na">—</span>' : String(Math.round(v));
+  // Cells are red when they fall below the live minimum (per site / per well).
+  const fmtCount = (v, minVal) => {
+    if (v == null) return '<span class="site-na">—</span>';
+    const bad = minVal != null && v < minVal;
+    return `<span style="color:${bad ? CLR.red : 'var(--text)'}">${Math.round(v)}</span>`;
+  };
   const rows = COUNT_ROWS.map(([label, col]) => {
-    const cells = SITE_IDS.map(s => fmtCount(_siteVal(plateName, well, s, col)));
-    cells.push(fmtCount(_wellVal(plateName, well, col)));  // suma por well (Python)
+    const isCells = col === 'Count_Cells';
+    const cells = SITE_IDS.map(s => fmtCount(_siteVal(plateName, well, s, col), isCells ? TH.cells_site_min : null));
+    cells.push(fmtCount(_wellVal(plateName, well, col), isCells ? TH.cells_well_min : null));  // sum per well
     return { label, cells };
   });
 
@@ -913,14 +1095,15 @@ function makeHeatmap(plateData, spec) {
     if (!vis) return `<b>${w}</b><br>${cmpd}<br>(hidden)`;
     let extraLine = '';
     if (robust) {
-      const sc  = (MAD_SCORES[spec.col]||{})[plateName]?.[w];
-      const zpl = sc ? (sc.z_pl>=0?'+':'') + sc.z_pl + '× MAD (plate)'  : null;
-      const zco = sc ? (sc.z_co>=0?'+':'') + sc.z_co + '× MAD (cohort)' : null;
-      if (zpl && zco) extraLine = `Plate MAD-score: ${zpl}<br>Cohort MAD-score: ${zco}`;
+      const wz = wellWorstZ(plateName, w, spec.col);
+      const fz = x => x == null ? 'n/a' : (x >= 0 ? '+' : '') + x.toFixed(2) + '× MAD';
+      extraLine = (wz && wz.eff != null)
+        ? `Worst site: <b>site ${wz.field}</b><br>Plate z: ${fz(wz.zpl)}<br>Cohort z: ${fz(wz.zco)}`
+        : 'z-score n/a (no same-perturbation reference)';
     } else {
       // Percentiles: indicar el sitio responsable del peor valor (well = peor sitio).
       const wf = (well._worst || {})[spec.col];
-      if (wf != null) extraLine = `Peor sitio: <b>site ${wf}</b>`;
+      if (wf != null) extraLine = `Worst site: <b>site ${wf}</b>`;
     }
     const cmpdColor = cmpd === 'DMSO' ? '#90c870' : cmpd ? '#a8c8ff' : 'var(--muted)';
     return `<b style="font-size:12px">${w}</b> <span style="color:${cmpdColor}">${cmpd||'—'}</span><br>`+
@@ -1012,7 +1195,7 @@ function renderCounts(plateName) {
     grid.appendChild(card);
 
     function drawCellsHeatmap() {
-      const threshold = 700;
+      const threshold = TH.cells_well_min;
       const filtered  = isFiltered();
       const gridcolor = filtered ? 'rgba(0,0,0,0)' : 'rgba(80,90,120,0.4)';
       const cRange    = COUNT_RANGES['Count_Cells'] || [null,null];
@@ -1036,7 +1219,7 @@ function renderCounts(plateName) {
         {paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'#0a0c18',
           font:{color:'#c8d8f0',size:11},margin:{t:40,b:50,l:50,r:70},
           height:340, width:520,
-          title:{text:`Cells (umbral: ${threshold})`,font:{size:13,color:'#a8c8ff'},x:0.5},
+          title:{text:`Cells (min per well: ${threshold})`,font:{size:13,color:'#a8c8ff'},x:0.5},
           xaxis:{type:'category',title:'Column',tickfont:{size:10},tickvals:COLS,ticktext:COLS.map(c=>parseInt(c)),
                   showgrid:!filtered,gridcolor,zeroline:false,fixedrange:true,automargin:false},
           yaxis:{type:'category',title:'Row',tickfont:{size:10},showgrid:!filtered,gridcolor,zeroline:false,fixedrange:true,automargin:false},
@@ -1048,7 +1231,7 @@ function renderCounts(plateName) {
 
   })();
  
-  // Card 2: Cells/Nuclei ratio with custom colour scale (1=green, 0.99-095=yellow, <0.95=red)
+  // Card 2: Cells/Nuclei ratio, colour scale driven by the live minimum-ratio threshold
   (function() {
     const cid  = `cnt-ratio`;
     const card = document.createElement('div');
@@ -1056,14 +1239,16 @@ function renderCounts(plateName) {
     card.innerHTML = `<div id="${cid}"></div>`;
     grid.appendChild(card);
  
+    // Red below the live minimum, amber within 0.02 above it, green beyond.
+    const rMinT  = TH.ratio_min;
+    const rzmin  = Math.max(0, Math.min(0.93, rMinT - 0.02)), rzmax = 1.0;
+    const rpos   = v => Math.min(1, Math.max(0, (v - rzmin) / (rzmax - rzmin)));
     const ratioCS = [
-      [0,     '#ff4444'],
-      [0.286, '#ff4444'],   // 0.95 = (0.95-0.93)/0.07
-      [0.286, '#ffbe00'],
-      [0.571, '#ffbe00'],   // 0.97 = (0.97-0.93)/0.07
-      [0.571, '#4bd760'],
-      [1.0,   '#4bd760'],
+      [0, '#ff4444'], [rpos(rMinT), '#ff4444'],
+      [rpos(rMinT), '#ffbe00'], [rpos(rMinT + 0.02), '#ffbe00'],
+      [rpos(rMinT + 0.02), '#4bd760'], [1.0, '#4bd760'],
     ];
+    const rTicks = [rMinT, rMinT + 0.02, 1.0].filter(v => v >= rzmin && v <= rzmax);
  
     const z    = ROWS_PLOTLY.map(r => COLS.map(c => {
       const w = r+c, well = pd.wells[w];
@@ -1087,10 +1272,10 @@ function renderCounts(plateName) {
     const gridcolor = filtered ? 'rgba(0,0,0,0)' : 'rgba(80,90,120,0.4)';
     registerHeatmap(Plotly.react(cid,
       [{type:'heatmap',z,text,hoverinfo:'text',x:COLS,y:ROWS_PLOTLY,
-         colorscale:ratioCS, zmin:0.93, zmax:1.0, xgap:4,ygap:4,
+         colorscale:ratioCS, zmin:rzmin, zmax:rzmax, xgap:4,ygap:4,
          colorbar:{thickness:14,len:0.85,tickfont:{size:10},
-                    tickvals:[0.93, 0.95, 0.97, 1.0],
-                    ticktext:['<0.95','0.95','0.97','1.00']}}],
+                    tickvals:rTicks,
+                    ticktext:rTicks.map(v => v.toFixed(2))}}],
        {paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'#0a0c18',
         font:{color:'#c8d8f0',size:11},margin:{t:40,b:50,l:50,r:20},height:340, width:520,
         title:{text:'Cells / Nuclei ratio',font:{size:13,color:'#a8c8ff'},x:0.5},
@@ -1135,7 +1320,7 @@ function renderCounts(plateName) {
       [{type:'heatmap',z,text,hoverinfo:'text',x:COLS,y:ROWS_PLOTLY,
          colorscale:artifactCS, zmin:0, zmax:100, xgap:4,ygap:4,
          colorbar:{thickness:14,len:0.85,tickfont:{size:10},
-                    tickvals:[0,100,250,100],ticktext:['0','100','250','≥100']}}],
+                    tickvals:[0,100],ticktext:['0','≥100']}}],
        {paper_bgcolor:'rgba(0,0,0,0)',plot_bgcolor:'#0a0c18',
         font:{color:'#c8d8f0',size:11},margin:{t:40,b:50,l:50,r:20},height:340, width:520,
         title:{text:'Illum. Artifacts',font:{size:13,color:'#a8c8ff'},x:0.5},
@@ -1166,6 +1351,22 @@ function renderCounts(plateName) {
   }));
 
   // Helper: crear una card de histograma y agregarlo al histRow
+  // Axis ranges for a histogram. With identical values (e.g. all-zero artifacts, a
+  // single Median Radius) the bin width is 0, so the counts are computed safely and
+  // both axes get an explicit range: counts never go below 0 and x is centred on the value.
+  function histAxes(values, nbins = 30) {
+    const lo = Math.min(...values), hi = Math.max(...values);
+    if (hi === lo) {
+      const pad = Math.max(Math.abs(lo) * 0.05, 0.5);
+      return { ymax: Math.max(1, Math.ceil(values.length * 1.15)),
+               xrange: [lo - pad, lo + pad],
+               xbins: { start: lo - pad / 2, end: lo + pad / 2, size: pad } };
+    }
+    const w = (hi - lo) / nbins, bins = new Array(nbins).fill(0);
+    values.forEach(v => { bins[Math.min(Math.floor((v - lo) / w), nbins - 1)]++; });
+    return { ymax: Math.max(1, Math.ceil(Math.max(...bins) * 1.15)), xrange: null, xbins: null };
+  }
+
   function addHistCard(cidHist, values, title, color, xLabel, threshold=null) {
     const card = document.createElement('div');
     card.className = 'count-hist-card';
@@ -1199,18 +1400,13 @@ function renderCounts(plateName) {
       </div>
       <div id="${cidHist}"></div>`;
 
-    const nbins30 = 30
-    const minV30 = Math.min(...values), maxV30 = Math.max(...values);
-    const binW30 = (maxV30 - minV30) / nbins30;
-    const bins30 = new Array(nbins30).fill(0);
-    values.forEach(v => { const i = Math.min(Math.floor((v - minV30) / binW30), nbins30 - 1); bins30[i]++; });
-    const ymax = Math.ceil(Math.max(...bins30) * 1.15);
+    const ax = histAxes(values), ymax = ax.ymax;
 
     Plotly.react(cidHist,
           [
             {
               type: 'histogram', x: values,
-              nbinsx: 30,
+              nbinsx: 30, ...(ax.xbins ? { xbins: ax.xbins } : {}),
               marker: { color: color, opacity: 0.85, line: { color: 'rgba(0,0,0,0.3)', width: 0.5 } },
               name: xLabel,
               hovertemplate: `${xLabel}: %{x}<br>Wells: %{y}<extra></extra>`,
@@ -1235,8 +1431,8 @@ function renderCounts(plateName) {
             margin: { t: 40, b: 50, l: 50, r: 20 },
             height: 320,
             title: { text: '', },
-            xaxis: { title: xLabel, tickfont: { size: 10 }, zeroline: false, gridcolor: 'rgba(80,90,120,0.4)' },
-            yaxis: { title: 'Wells', tickfont: { size: 10 }, zeroline: false, gridcolor: 'rgba(80,90,120,0.4)', range: [0, ymax] },
+            xaxis: { title: xLabel, tickfont: { size: 10 }, zeroline: false, gridcolor: 'rgba(80,90,120,0.4)', ...(ax.xrange ? { range: ax.xrange } : {}) },
+            yaxis: { title: 'Wells', tickfont: { size: 10 }, zeroline: false, gridcolor: 'rgba(80,90,120,0.4)', range: [0, ymax], rangemode: 'tozero', fixedrange: true },
             showlegend: false,
             bargap: 0.05,
             hoverlabel: { bgcolor: '#141c34', bordercolor: '#304080', font: { size: 12, color: '#d0e0ff', family: 'monospace' } },
@@ -1264,16 +1460,11 @@ function renderCounts(plateName) {
       </div>
       <div id="${cidHist}"></div>`;
     
-    const nbins30=30
-    const minV30 = Math.min(...values), maxV30 = Math.max(...values);
-    const binW30 = (maxV30 - minV30) / nbins30;
-    const bins30 = new Array(nbins30).fill(0);
-    values.forEach(v => { const i = Math.min(Math.floor((v -minV30) / binW30), nbins30 - 1); bins30[i]++; });
-    const ymax = Math.ceil(Math.max(...bins30) * 1.15)
-    
+    const ax = histAxes(values), ymax = ax.ymax;
+
     Plotly.react(cidHist,
       [
-        {type:'histogram', x:values, nbinsx:30,
+        {type:'histogram', x:values, nbinsx:30, ...(ax.xbins ? {xbins: ax.xbins} : {}),
           marker:{color:color, opacity:0.85, line:{color:'rgba(0,0,0,0.3)', width:0.5}},
           hovertemplate:`${xLabel}: %{x}<br>Wells: %{y}<extra></extra>`,
         },
@@ -1287,8 +1478,8 @@ function renderCounts(plateName) {
         font:{color:'#c8d8f0', size:11},
         margin:{t:10, b:50, l:50, r:20},
         height:280, showlegend:false,
-        xaxis:{title:xLabel, tickfont:{size:10}, zeroline:false, gridcolor:'rgba(80,90,120,0.4)'},
-        yaxis:{title:'Wells', tickfont:{size:10}, zeroline:false, gridcolor:'rgba(80,90,120,0.4)', range: [0, ymax] },
+        xaxis:{title:xLabel, tickfont:{size:10}, zeroline:false, gridcolor:'rgba(80,90,120,0.4)', ...(ax.xrange ? {range: ax.xrange} : {})},
+        yaxis:{title:'Wells', tickfont:{size:10}, zeroline:false, gridcolor:'rgba(80,90,120,0.4)', range:[0, ymax], rangemode:'tozero', fixedrange:true},
         bargap:0.05,
         hoverlabel:{bgcolor:'#141c34', bordercolor:'#304080', font:{size:12, color:'#d0e0ff', family:'monospace'}},
       },
@@ -1296,9 +1487,9 @@ function renderCounts(plateName) {
     );
   }
 
-  const cellThreshold = parseInt(document.getElementById('cells-threshold-slider')?.value || 700);
+  const cellThreshold = TH.cells_well_min;
   addHistCard('hist-cells',     allCells,     'Cells — distribution',        '#4b8fd7', 'Count_Cells',   cellThreshold);
-  addHistCard('hist-ratio',     allRatios,    'Cells/Nuclei — distribution', '#4bd760', 'Ratio',         0.95);
+  addHistCard('hist-ratio',     allRatios,    'Cells/Nuclei — distribution', '#4bd760', 'Ratio',         TH.ratio_min);
   addHistCard('hist-artifacts', allArtifacts, 'Artifacts — distribution',    '#ff6666', 'Count_Artifacts', null);
 
   // ── Median Radius section ─────────────────────────────────────────────────
@@ -1639,7 +1830,7 @@ function renderMFI() {
           if      (o2b==null)  { snrColor='var(--muted)'; snrLabel='N/A'; }
           else if (o2b >= 0.5) { snrColor='#4bd760';      snrLabel=`${o2b.toFixed(2)}×`; }
           else if (o2b >= 0.2) { snrColor='#ffbe00';      snrLabel=`${o2b.toFixed(2)}×`; }
-          else                 { snrColor='#ff4444';      snrLabel=`${o2b}×`; }
+          else                 { snrColor='#ff4444';      snrLabel=`${o2b.toFixed(2)}×`; }
           return `· img: ${imgMed.toFixed(5)} · <b>Δ: ${delta>=0?'+':''}${delta.toFixed(5)}</b>`
             + ` · <span title="O2B = Δ / MFI_img — fold-change of objects over background"
                 style="color:${snrColor};cursor:help;">O2B: ${snrLabel}</span>`;
@@ -2479,29 +2670,186 @@ function downloadMfiCsv() {
 })();
 
 
-// ─── Quality-criteria toggles: wiring ────────────────────────────────────────
-// When a criterion checkbox changes, update the active set and re-render the
-// verdict colours (overview + current well's montage). The per-metric detail
-// tables and per-family red-count columns are intentionally left untouched.
-(function wireCriteriaToggles() {
-  document.querySelectorAll('.criterion-cb').forEach(cb => {
-    cb.addEventListener('change', () => {
-      if (cb.checked) activeCriteria.add(cb.value);
-      else            activeCriteria.delete(cb.value);
+// ─── Thresholds panel, criteria toggles and downloads ────────────────────────
+// One state (TH + activeCriteria) drives every classification in the report.
+//   · Criteria checkboxes (Plate Browser bar AND this panel) stay in sync and
+//     only change which families count → verdict views + failed-sites list.
+//   · Threshold inputs change the classification itself → full refresh
+//     (summary, overview, heatmaps, count maps, open panels).
+function updateModifiedBadge() {
+  const n = Object.keys(TH_DEFAULTS).filter(k => TH[k] !== TH_DEFAULTS[k]).length;
+  const el = document.getElementById('th-modified-badge');
+  if (el) el.textContent = n ? `${n} threshold${n > 1 ? 's' : ''} modified` : '';
+  document.querySelectorAll('.th-input').forEach(inp =>
+    inp.classList.toggle('modified', TH[inp.dataset.key] !== TH_DEFAULTS[inp.dataset.key]));
+}
 
-      // Re-colour the overview for the current plate.
-      if (typeof currentPlate !== 'undefined' && currentPlate) {
-        buildOverlaySVG(currentPlate);
-        // Keep the selected well highlighted after the SVG is rebuilt.
-        if (selectedWell) {
-          const rect = document.getElementById(`sv-${selectedWell}`);
-          if (rect) rect.classList.add('selected');
-          // Re-colour the montage site tiles for the selected well.
-          renderWellMontage(currentPlate, selectedWell);
-        }
-      }
-    });
+function updateFailedSummary() {
+  const el = document.getElementById('failed-summary');
+  if (!el) return;
+  const rows  = failedSiteRows();
+  const wells = new Set(rows.map(r => r.plate + '|' + r.well));
+  let nSites = 0;
+  PLATES.forEach(p => Object.values(DATA[p].site_data || {})
+    .forEach(w => { nSites += Object.keys(w).length; }));
+  el.innerHTML = activeCriteria.size
+    ? `<b>${rows.length}</b> failed site(s) in <b>${wells.size}</b> well(s), out of ${nSites} sites, `
+      + `under the active criteria and current thresholds.`
+    : 'No criterion is active, so no site can fail.';
+  const btn = document.getElementById('failed-csv-btn');
+  if (btn) btn.disabled = rows.length === 0;
+}
+
+// Re-render everything that depends on WHICH criteria are active.
+function refreshVerdictViews() {
+  renderSummary();
+  if (!currentPlate) return;
+  buildOverlaySVG(currentPlate);
+  if (selectedWell) {
+    const rect = document.getElementById(`sv-${selectedWell}`);
+    if (rect) rect.classList.add('selected');
+    renderWellInfo(currentPlate, selectedWell);
+    renderWellMontage(currentPlate, selectedWell);
+    renderSiteTables(currentPlate, selectedWell);
+  }
+}
+// Re-render everything that depends on the threshold VALUES.
+function refreshAll() {
+  invalidateEval();
+  updateModifiedBadge();
+  refreshVerdictViews();
+  if (!currentPlate) return;
+  const activeTab = document.querySelector('#metrics-tabs .tab.active');
+  const group = activeTab ? activeTab.dataset.group : null;
+  renderMetrics(currentPlate);
+  if (group && group !== '0') {
+    const tab = document.querySelector(`#metrics-tabs .tab[data-group="${group}"]`);
+    if (tab) tab.click();
+  }
+  renderCounts(currentPlate);
+}
+
+// Validate one input and, if valid, store it in TH. Warning must not exceed fail.
+function applyThresholdInput(inp) {
+  const key = inp.dataset.key, val = parseFloat(inp.value);
+  const lo = parseFloat(inp.min), hi = parseFloat(inp.max);
+  const msg = document.getElementById('th-msg');
+  const bad = m => { inp.classList.add('invalid'); msg.textContent = m; return false; };
+  if (inp.value.trim() === '' || !isFinite(val)) return bad('Enter a number.');
+  if (val < lo || val > hi) return bad(`Value must be between ${lo} and ${hi}.`);
+  if (key.endsWith('_warn') && val > TH[key.replace('_warn', '_fail')])
+    return bad('The warning threshold cannot exceed the fail threshold.');
+  if (key.endsWith('_fail') && val < TH[key.replace('_fail', '_warn')])
+    return bad('The fail threshold cannot be below the warning threshold.');
+  inp.classList.remove('invalid');
+  msg.textContent = '';
+  TH[key] = val;
+  return true;
+}
+
+(function buildThresholdPanel() {
+  const host = document.getElementById('threshold-grid');
+  if (!host) return;
+  TH_SPEC.ui.forEach(g => {
+    const box = document.createElement('div');
+    box.className = 'th-group';
+    box.dataset.criterion = g.criterion;
+    box.innerHTML =
+      `<label class="th-head"><input type="checkbox" class="criterion-cb" value="${g.criterion}" checked> ${g.group}</label>`
+      + g.fields.map(f =>
+        `<label class="th-field" title="${f.help}"><span>${f.label}</span>`
+        + `<input type="number" class="th-input" data-key="${f.key}" step="${f.step}" `
+        + `min="${f.min}" max="${f.max}" value="${TH[f.key]}"></label>`).join('');
+    host.appendChild(box);
   });
+
+  let timer = null;
+  host.addEventListener('input', ev => {
+    const inp = ev.target;
+    if (!inp.classList || !inp.classList.contains('th-input')) return;
+    clearTimeout(timer);
+    timer = setTimeout(() => { if (applyThresholdInput(inp)) refreshAll(); }, 350);
+  });
+
+  document.getElementById('th-reset-btn').onclick = () => {
+    Object.assign(TH, TH_DEFAULTS);
+    document.querySelectorAll('.th-input').forEach(inp => {
+      inp.value = TH[inp.dataset.key];
+      inp.classList.remove('invalid');
+    });
+    document.getElementById('th-msg').textContent = '';
+    refreshAll();
+  };
+
+  document.querySelectorAll('.js-min-sites').forEach(el => { el.textContent = TH_SPEC.minGroupSites; });
+  ['th-znote', 'znote-metrics'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = Q.zNote || '';
+  });
+})();
+
+// Criteria checkboxes: the Plate Browser bar and the panel share one state.
+document.addEventListener('change', ev => {
+  const cb = ev.target;
+  if (!cb.classList || !cb.classList.contains('criterion-cb')) return;
+  if (cb.checked) activeCriteria.add(cb.value);
+  else            activeCriteria.delete(cb.value);
+  document.querySelectorAll(`.criterion-cb[value="${cb.value}"]`)
+    .forEach(o => { o.checked = cb.checked; });
+  document.querySelectorAll('.th-group')
+    .forEach(g => g.classList.toggle('th-off', !activeCriteria.has(g.dataset.criterion)));
+  refreshVerdictViews();
+});
+
+// ─── Failed-sites download ───────────────────────────────────────────────────
+// One row per failed plate-well-site under the ACTIVE criteria and the LIVE
+// thresholds. Column names match the pipeline's *_flagged_sites.parquet so the
+// file can be joined/filtered the same way downstream. failed_criteria is a
+// ';'-separated list (e.g. "slope:Hoechst;pctmax:ER"); well-level failures
+// (low_cell_count_well) list every site of the well.
+function _saveText(name, mime, text) {
+  const url = URL.createObjectURL(new Blob([text], { type: mime }));
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+function _cohortSlug() { return (document.title || 'cohort').split(' — ')[0].trim().replace(/\s+/g, '_'); }
+
+function downloadFailedSites() {
+  const rows = failedSiteRows();
+  const header = ['Metadata_Plate', 'Metadata_Well', 'Metadata_Field', 'Perturbation', 'failed_criteria'];
+  const lines = [header.join(',')].concat(rows.map(r =>
+    [r.plate, r.well, r.site, r.cmpd, r.criteria.join(';')].map(csvCell).join(',')));
+  _saveText(`${_cohortSlug()}_failed_sites.csv`, 'text/csv;charset=utf-8;', lines.join('\n'));
+}
+
+// The settings behind a given list, so it can be reproduced or audited later.
+function downloadSettings() {
+  const rows = failedSiteRows();
+  const obj = {
+    generated: new Date().toISOString(),
+    thresholds: TH,
+    defaults: TH_DEFAULTS,
+    modified: Object.keys(TH_DEFAULTS).filter(k => TH[k] !== TH_DEFAULTS[k]),
+    activeCriteria: TH_SPEC.criteria.map(c => c.key).filter(k => activeCriteria.has(k)),
+    inactiveCriteria: TH_SPEC.criteria.map(c => c.key).filter(k => !activeCriteria.has(k)),
+    zReference: {
+      scope: 'same-perturbation wells only (plate z and cohort z; a site fails if either exceeds the fail threshold)',
+      minGroupSites: TH_SPEC.minGroupSites,
+      note: Q.zNote || null,
+    },
+    failedSites: rows.length,
+    failedWells: new Set(rows.map(r => r.plate + '|' + r.well)).size,
+  };
+  _saveText(`${_cohortSlug()}_failed_sites_settings.json`, 'application/json', JSON.stringify(obj, null, 2));
+}
+
+(function wireFailedDownloads() {
+  const a = document.getElementById('failed-csv-btn');
+  const b = document.getElementById('settings-json-btn');
+  if (a) a.onclick = downloadFailedSites;
+  if (b) b.onclick = downloadSettings;
 })();
 
 

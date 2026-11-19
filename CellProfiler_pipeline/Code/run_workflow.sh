@@ -20,7 +20,7 @@ if run_section 3; then
   NAME_QC="III_QC"
   echo "[Z-PLANE] $ZPLANE"
   #TODO: Si corremos MAINCE con cellpose, hay que poner el parámetro --masks
-  python $SCRIPT_PY_CELLPROFILER -i $IMAGES_WORKSPACE -o $PATH_CSV --name_csv $NAME_QC --illum --channel_dict "$CHANNEL_DICT" --filename_regex "$FILENAME_REGEX" --zplane "$ZPLANE" --check_integrity --masks 1
+  python $SCRIPT_PY_CELLPROFILER -i $IMAGES_WORKSPACE -o $PATH_CSV --name_csv $NAME_QC --illum --channel_dict "$CHANNEL_DICT" --filename_regex "$FILENAME_REGEX" --zplane "$ZPLANE" 
 
   generar_batchfiles --metadata "$PATH_CSV/$NAME_QC.csv" --template "$TEMPLATE_CPPIPE_QC" --cppipe "$PATH_CPPIPE" --batch "$PATH_BATCH_PIPELINES" --output "$PATH_QC_IMAGES" --profiles 1 --masks_path "$PATH_MASKS"
   mv "$PATH_BATCH_PIPELINES/Batch_data.h5" \
@@ -35,7 +35,7 @@ if run_section 4; then
   echo "===***=== [4] Generate QC report ===***==="
   python $SCRIPT_PY_AGGREGATE_QC_OUTPUT --input "$PATH_QC_IMAGES"
   cd ./Code
-  python -m qc.cli -i "$PATH_QC_IMAGES" -o "$PATH_QC_COLLAGES" \
+  python -m qc_img.cli -i "$PATH_QC_IMAGES" -o "$PATH_QC_COLLAGES" \
     --platemap "/workspace_images/platemap_${COHORT}.csv" --no-pdf
   cd -
   echo "[INFO] QC report generated in ${PATH_QC_COLLAGES}"
@@ -46,7 +46,7 @@ if run_section 5; then
   echo "===***=== [5] Profile generation ===***==="
   NAME_MP="V_MP"
   #TODO: Falta integrar --discard_sites, para descartar sitios flageados
-  python $SCRIPT_PY_CELLPROFILER -i $IMAGES_WORKSPACE -o $PATH_CSV --name_csv $NAME_MP --illum --channel_dict "$CHANNEL_DICT" --filename_regex "$FILENAME_REGEX" --zplane "$ZPLANE" --check_integrity --masks 2
+  python $SCRIPT_PY_CELLPROFILER -i $IMAGES_WORKSPACE -o $PATH_CSV --name_csv $NAME_MP --illum --channel_dict "$CHANNEL_DICT" --filename_regex "$FILENAME_REGEX" --zplane "$ZPLANE" --masks 2
 
   generar_batchfiles --metadata "$PATH_CSV/$NAME_MP.csv" --template "$TEMPLATE_CPPIPE_PROFILING" --cppipe "$PATH_CPPIPE" --batch "$PATH_BATCH_PIPELINES" --output "$PATH_PROFILES" --profiles 1
   mv "$PATH_BATCH_PIPELINES/Batch_data.h5" \

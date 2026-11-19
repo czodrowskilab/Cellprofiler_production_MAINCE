@@ -15,14 +15,51 @@
  
 <!-- 1. COHORT SUMMARY -->
 <div class="section">
-  <h2>Cohort Summary</h2>
+  <h2 style="display:flex; align-items:center; justify-content:space-between;">
+    <span>Cohort Summary</span>
+    <span class="h2-actions">
+      <button id="failed-csv-btn" class="iv-mini-btn"
+              title="Download every failed plate-well-site under the thresholds and criteria currently selected below"
+              style="font-size:0.7em; font-weight:normal;">&#10515; Download failed sites (CSV)</button>
+      <button id="settings-json-btn" class="iv-mini-btn"
+              title="Download the thresholds and active criteria that produced the failed-sites list"
+              style="font-size:0.7em; font-weight:normal;">&#10515; Settings (JSON)</button>
+    </span>
+  </h2>
+
+  <details class="threshold-panel" id="threshold-panel" open>
+    <summary>Quality criteria &amp; thresholds <span id="th-modified-badge" class="th-badge"></span></summary>
+    <div class="th-intro">
+      A site <b>fails</b> when it breaks any <i>active</i> criterion below; a well fails when any of its
+      sites fails (or when it breaks a well-level criterion). Defaults are the values used by the
+      pipeline; edits apply instantly to the summary, heatmaps, plate overview and the failed-sites
+      download. <b>Warning</b> thresholds only change colour (amber); they never mark a failure.
+      Blur and MedianIntensity use robust z-scores, z = (x &minus; median) / MAD, computed
+      <b>only against wells that share the same perturbation</b>: within the same plate (z<sub>pl</sub>)
+      and across the whole cohort (z<sub>co</sub>). A site fails if |z<sub>pl</sub>| <i>or</i>
+      |z<sub>co</sub>| exceeds the fail threshold.
+    </div>
+    <div class="th-grid" id="threshold-grid"></div>
+    <div class="th-actions">
+      <button id="th-reset-btn" class="iv-mini-btn" title="Restore every threshold to its default value">Reset thresholds to defaults</button>
+      <span id="th-msg" class="th-msg"></span>
+    </div>
+    <div class="th-note" id="th-znote"></div>
+  </details>
+
+  <div class="failed-summary" id="failed-summary"></div>
+
   <table class="summary-table">
     <thead>
-      <tr><th>Plate</th><th>Wells</th>
-          <th>Blur</th><th>Debris</th><th>Low Cell Density</th><th>MedianIntensity</th><th>Object to background contrast (O2B in MFI)</th><th>Positional Effects (ANOVA in MFI)</th></tr>
+      <tr><th>Plate</th><th>Wells</th><th>Failed wells<br><span class="th-sub">(active criteria)</span></th>
+          <th>Blur</th><th>Debris</th><th>Low Cell Density</th><th>MedianIntensity</th>
+          <th>Cells / Nuclei</th><th>Cell count</th>
+          <th>Object to background contrast (O2B in MFI)</th><th>Positional Effects (ANOVA in MFI)</th></tr>
     </thead>
     <tbody id="summary-tbody"></tbody>
   </table>
+  <div class="summary-foot">Per-criterion columns count wells that fail that criterion at the current
+    thresholds, regardless of which criteria are active; <b>Failed wells</b> counts only the active ones.</div>
 </div>
  
 <!-- 2. PLATE BROWSER -->
@@ -37,15 +74,18 @@
       <span class="criteria-label">Verdict criteria:</span>
       <label><input type="checkbox" class="criterion-cb" value="slope" checked> Blur</label>
       <label><input type="checkbox" class="criterion-cb" value="debris" checked> Debris</label>
-      <label><input type="checkbox" class="criterion-cb" value="ldens" checked> Low density</label>
-      <label><input type="checkbox" class="criterion-cb" value="medint" checked> MedInt</label>
+      <label><input type="checkbox" class="criterion-cb" value="ldens" checked> Low cell density</label>
+      <label><input type="checkbox" class="criterion-cb" value="medint" checked> MedianIntensity</label>
+      <label><input type="checkbox" class="criterion-cb" value="ratio" checked> Cells/Nuclei</label>
+      <label><input type="checkbox" class="criterion-cb" value="cells" checked> Cell count</label>
     </div>
   </div>
   <div class="browser-legend">
-    Each well's colour is its <b>worst site</b>: robust metrics (Blur, MedianIntensity) by cohort
-    MAD-score bands, percentile metrics (Debris, Low Cell Density) by their worst-site value. In the
-    detail panels, robust rows show both MAD-scores (z<sub>pl</sub>, z<sub>co</sub>) and
-    percentile rows point to the responsible <b>site</b>.
+    Each well's colour is its <b>worst site</b> under the active criteria and the thresholds set in
+    <i>Cohort Summary</i>. Blur and MedianIntensity are coloured from the robust z-score (the larger of
+    |z<sub>pl</sub>| and |z<sub>co</sub>|, computed against same-perturbation wells only); Debris and Low
+    Cell Density from the worst site's value; Cells/Nuclei and Cell count turn a well red when they fail.
+    The detail panels list the z-scores, the responsible <b>site</b> and every failed criterion.
   </div>
  
   <!-- Well detail row: info panel (left) + montage (center) + site info (right) -->
@@ -74,7 +114,42 @@
   </div>
 </div>
  
-<!-- 3. QC METRICS -->
+<!-- 3. PCA (deviant-plate detection) -->
+<div class="section" id="pca-section">
+  <h2>Plate PCA <span class="iv-optional">deviant-plate detection</span></h2>
+  <div class="feature-audit">
+    <div class="audit-row">
+      Principal component analysis over every numeric well feature (image-quality metrics such as
+      focus slope, median intensity and % maximal, the 10th-percentile intensity, object counts and image area,
+      across all channels),
+      standardised to z-scores so features on different scales contribute comparably.
+    </div>
+    <div class="audit-row" style="margin-top:4px;">
+      The PCA is fitted on all wells and projected onto the first two components. Each
+      <b style="color:#c8d8f0;">well</b> is a small point; each <b style="color:#c8d8f0;">plate</b>
+      is the centroid of its wells. A plate whose centroid sits far from the cluster is a
+      candidate outlier — a systematic shift affecting the whole plate (illumination,
+      incubation, staining batch). Hover a point for its plate, well and compound; the
+      <b>deviation</b> score is the distance of a plate's centroid from the cohort centre
+      in PC space.
+    </div>
+    <div class="audit-row" style="margin-top:4px; color:var(--muted); font-size:0.78rem;">
+      This is a qualitative screen, not a verdict: the first two components capture only
+      part of the total variance (see the PC1 / PC2 percentages below), so a plate can drift
+      along axes not shown. A flagged well or plate also warrants care — it may reflect a
+      genuine phenotypic response to the perturbation rather than a technical artefact.
+      The section is hidden when there are fewer than 3 plates or 6 wells, where a PCA is not
+      meaningful.
+    </div>
+  </div>
+  <p class="section-note" id="pca-note"></p>
+  <div class="pca-controls" id="pca-controls">
+    <label><input type="checkbox" id="pca-show-wells" checked> Show individual wells</label>
+  </div>
+  <div id="pca-plot" style="width:100%; height:520px;"></div>
+</div>
+
+<!-- 4. QC METRICS -->
 <div class="section">
   <h2>QC Metrics</h2>
   <div class="feature-audit">
@@ -82,65 +157,70 @@
       <span class="audit-label">Source</span>
       All metrics from <span class="thresh">ImageQuality_*</span>
       <span class="audit-source">← Image.txt</span>
-      &nbsp;— one row per site per well, aggregated to plate level.
+      &nbsp;— one row per imaging site. Site values drive the pass/fail verdict; the well value shown in
+      the platemaps is the mean of its sites for Blur and MedianIntensity, and the worst site for
+      Debris and Low cell density.
     </div>
     <hr class="audit-sep">
     <div class="audit-row">
       <b style="color:#a8c8f0;">Blur (PowerLogLogSlope)</b>: log-log slope of the pixel intensity
-      power spectrum (a focus proxy). Coloured by <b style="color:#c8d8f0;">cohort MAD-score</b>
-      in discrete bands: <span style="color:#4bd760;">■</span> |z| ≤ 1 ·
-      <span style="color:#ffbe00;">■</span> 1–3 · <span style="color:#ff4444;">■</span> &gt; 3.
-      Both the plate and cohort MAD-scores are shown next to the value in the Plate Browser.
-      The same rule colours the platemaps, the well/site panels and the verdict borders —
-      one colour engine, no mismatches.
+      power spectrum (a focus proxy). Each <b style="color:#c8d8f0;">site</b> gets a robust z-score,
+      z = (x &minus; median) / MAD (MAD = median absolute deviation), computed
+      <b style="color:#c8d8f0;">only against sites of wells that share the same perturbation</b>
+      (same compound in the platemap): once within its own plate (<b>plate z</b>, z<sub>pl</sub>) and once
+      across all plates (<b>cohort z</b>, z<sub>co</sub>). Site values are pooled (9 sites per well, so n technical replicates give 9&times;n values). A reference group needs at least
+      <span class="js-min-sites">15</span> sites (one complete well); smaller groups produce no z-score and that half of the check is skipped.
+      Without a platemap, all wells count as one perturbation. A site's score is
+      max(|z<sub>pl</sub>|, |z<sub>co</sub>|). Colours:
+      <span style="color:#4bd760;">■</span> up to the warning threshold ·
+      <span style="color:#ffbe00;">■</span> between warning and fail ·
+      <span style="color:#ff4444;">■</span> above the fail threshold
+      (defaults 1 and 3; editable in Cohort Summary). A well takes the colour of its worst site.
     </div>
     <hr class="audit-sep">
     <div class="audit-row">
       <b style="color:#a8c8f0;">Debris (PercentMaximal)</b>: Fraction of pixels at maximum intensity
-      (saturated). High values indicate overexposure or debris.
-      <span style="color:#4bd760;">■ green</span> &lt; 0.1% &nbsp;·&nbsp;
-      <span style="color:#ffbe00;">■ yellow</span> 0.1–1% &nbsp;·&nbsp;
-      <span style="color:#ff4444;">■ red</span> &gt; 1%.
+      (saturated). High values indicate overexposure or debris. Coloured by the worst site's value:
+      <span style="color:#4bd760;">■ green</span> below the warning threshold (default 0.1%) &nbsp;·&nbsp;
+      <span style="color:#ffbe00;">■ amber</span> up to the fail threshold (default 1%) &nbsp;·&nbsp;
+      <span style="color:#ff4444;">■ red</span> above it.
       <br><span style="font-size:0.8rem;color:var(--muted);">
       Aggregated to the well by its <b style="color:#c8d8f0;">worst site</b> (not the mean),
       so a single debris-laden field is not diluted across the well. The responsible site
       is shown next to the value in the Plate Browser and in the platemap tooltip.</span>
     </div>
     <div class="audit-row" style="margin-top:4px;">
-      <b style="color:#a8c8f0;">Lowe Cell Density</b> (Ratio_P10/P90):
-      Ratio_P10/P90 corresponds to the ratio between <i>Intensity_Percentile_10_Syto</i> and 
-      <i>Intensity_Percentile_90_Syto</i>, that gets closer to 1 when the intensity in the syto channel 
-      of percentile 10 and 90 are closer. This indicates an immage with low cell density.
+      <b style="color:#a8c8f0;">Low Cell Density</b> (Ratio_P10/P90):
+      ratio between <i>Intensity_Percentile_10_Syto</i> and <i>Intensity_Percentile_90_Syto</i>. It
+      approaches 1 when the 10th and 90th intensity percentiles are close, which indicates an image
+      with low cell density.
       <br>Coloured by <b>absolute thresholds</b>:
-      <span style="color:#ff4444;">■ red</span> &gt; 0.5 (fail) &nbsp;·&nbsp;
-      <span style="color:#ffbe00;">■ yellow</span> 0.4-0.5 (warning) &nbsp;·&nbsp;
-      <span style="color:#4bd760;">■ green</span> &lt; 0.4.
+      <span style="color:#4bd760;">■ green</span> below the warning threshold (default 0.4) &nbsp;·&nbsp;
+      <span style="color:#ffbe00;">■ amber</span> up to the fail threshold (default 0.5) &nbsp;·&nbsp;
+      <span style="color:#ff4444;">■ red</span> above it.
       <br><span style="font-size:0.8rem;color:var(--muted);">
-      Aggregated to the well by its <b style="color:#c8d8f0;">worst site</b> (here the site
-      with the <i>lowest</i> floor), with the responsible site reported alongside the value.
-      A well fails (red verdict) if any channel's worst site drops above 0.5.</span>
+      Aggregated to the well by its <b style="color:#c8d8f0;">worst site</b> (the one with the highest
+      ratio); the responsible site is reported alongside the value. A well fails if any site exceeds the
+      fail threshold.</span>
     </div>
     <hr class="audit-sep">
     <div class="audit-row">
         <b style="color:#a8c8f0;">MedianIntensity</b>: Median pixel intensity across the image.
-        Used to detect global brightness differences across wells or plates. Coloured by the
-        cohort MAD-score in the same discrete |z| bands as PowerLogLogSlope.<br>
+        Used to detect global brightness differences across wells or plates. Scored exactly like Blur:
+        a robust z-score per site against <b style="color:#c8d8f0;">same-perturbation wells only</b>
+        (plate z and cohort z, effective score = the larger |z|), coloured by the warning and fail
+        thresholds (defaults 1 and 5; editable in Cohort Summary).<br>
         <span style="font-size:0.8rem;margin-top:4px;display:inline-block;">
-            <b style="color:#c8d8f0;">MAD-score</b> shown in tooltip: deviation from plate/cohort median,
-            expressed in units of MAD (Median Absolute Deviation).
-            &nbsp;·&nbsp;
-            <b style="color:#c8d8f0;">Plate MAD-score</b>: (well − plate_median) / plate_MAD
-            &nbsp;·&nbsp;
-            <b style="color:#c8d8f0;">Cohort MAD-score</b>: (well − cohort_median) / cohort_MAD.<br>
-            <span style="color:#4bd760;">■</span> ≤ 1× MAD, typical &nbsp;·&nbsp;
-            <span style="color:#ffbe00;">■</span> 1–3× MAD, moderate deviation &nbsp;·&nbsp;
-            <span style="color:#ff4444;">■</span> &gt; 3× MAD, strong outlier.
-            &nbsp;·&nbsp;
-            <span style="color:var(--muted);">
+            <b style="color:#c8d8f0;">Plate z</b>: (site &minus; plate median) / plate MAD, over sites of the
+            same perturbation in that plate &nbsp;·&nbsp;
+            <b style="color:#c8d8f0;">Cohort z</b>: (site &minus; cohort median) / cohort MAD, over sites of the
+            same perturbation in all plates.
+            The tooltip and detail panels show the z-scores of the worst site.
+            <span id="znote-metrics" style="display:block;color:var(--muted);margin-top:3px;"></span>
         </span>
     </div>
   </div>
-  <!-- Site-level metrics table (por well seleccionado) -->
+  <!-- Site-level metrics table (for the selected well) -->
   <div class="site-table-wrap" id="qc-site-table-wrap" style="display:none;">
     <div class="site-table-head">
       <span class="site-table-title" id="qc-site-table-title">Site-level metrics</span>
@@ -157,12 +237,12 @@
     <div id="metrics-contents"></div>
   </div>
  
-<!-- 4. CELL COUNTS -->
+<!-- 5. CELL COUNTS -->
 <div class="section">
   <h2>Cell Counts</h2>
 <div class="feature-audit">
     <div class="audit-row" style="margin-bottom:6px;">
-      Cell counts are aggregated per well from <span class="thresh">Image.txt</span> (one row per imaging site).
+      Cell counts come from <span class="thresh">Image.txt</span> (one row per imaging site) and are summed per well.
       Low cell counts may indicate cytotoxicity, poor seeding, or segmentation failure.
       The <b style="color:#a8c8f0;">Cells / Nuclei ratio</b> detects segmentation errors:
       a ratio below 1 means some nuclei were not matched to a cell body, often due to
@@ -175,15 +255,16 @@
       <span class="audit-label">Cells</span>
       <span class="thresh">Count_Cells</span>
       <span class="audit-source">← Image.txt</span>
-      &nbsp;— use the slider below to flag wells below a minimum count threshold.
+      &nbsp;— a site fails below the minimum cells per site and a well fails below the minimum cells per well
+      (defaults 70 and 700; editable in Cohort Summary).
     </div>
     <div class="audit-row">
       <span class="audit-label">Ratio</span>
       <span class="thresh">Count_Cells / Count_Nuclei</span>
       &nbsp;—
-      <span style="color:#4bd760;font-size:0.78rem;">■ 1.00</span>
-      <span style="color:#ffbe00;font-size:0.78rem;">■ 0.99–0.95</span>
-      <span style="color:#ff4444;font-size:0.78rem;">■ &lt;0.95</span>
+      <span style="color:#4bd760;font-size:0.78rem;">■ well above the threshold</span>
+      <span style="color:#ffbe00;font-size:0.78rem;">■ within 0.02 above it</span>
+      <span style="color:#ff4444;font-size:0.78rem;">■ below the threshold (default 0.95)</span>
     </div>
     <div class="audit-row">
       <span class="audit-label">Illum. Artifacts</span>
@@ -201,7 +282,7 @@
       
     </div>
   </div>
-  <!-- Site-level counts table (por well seleccionado) -->
+  <!-- Site-level counts table (for the selected well) -->
   <div class="site-table-wrap" id="counts-site-table-wrap" style="display:none;">
     <div class="site-table-head">
       <span class="site-table-title" id="counts-site-table-title">Site-level counts</span>
@@ -215,7 +296,7 @@
   <div class="counts-hist-row" id="radius-hist-row"></div>
 </div>
  
-<!-- 5. MFI (Median Fluorescence Intensity) -->
+<!-- 6. MFI (Median Fluorescence Intensity) -->
 <div class="section">
   <h2 style="display:flex; align-items:center; justify-content:space-between;">
     <span>Median Fluorescence Intensity (MFI)</span>
@@ -241,8 +322,8 @@
     </div>
     <div class="audit-row" style="margin-top:4px;">
       <b style="color:#a8c8f0;">Δ = MFI<sub>obj</sub> − MFI<sub>img</sub></b>:
-      difference between the plate-level median of the per-site object medians and the
-      whole-image median (ImageQuality_MedianIntensity, Image.txt), which includes
+      difference between the plate median of the per-site object medians and the plate median of the
+      whole-image median intensity per well (ImageQuality_MedianIntensity, Image.txt), which includes
       background pixels.
     </div>
     <div class="audit-row" style="margin-top:4px;">
@@ -302,41 +383,6 @@
   <div id="mfi-content"></div>
   <div id="mfi-tooltip"></div>
 </div>
-
-<!-- 6. PCA (deviant-plate detection) -->
-<div class="section" id="pca-section">
-  <h2>Plate PCA <span class="iv-optional">deviant-plate detection</span></h2>
-  <div class="feature-audit">
-    <div class="audit-row">
-      Principal component analysis over every numeric well feature (focus slope, median
-      intensity, focus score, % maximal / minimal, and object counts, across all channels),
-      standardised to z-scores so features on different scales contribute comparably.
-    </div>
-    <div class="audit-row" style="margin-top:4px;">
-      The PCA is fitted on all wells and projected onto the first two components. Each
-      <b style="color:#c8d8f0;">well</b> is a small point; each <b style="color:#c8d8f0;">plate</b>
-      is the centroid of its wells. A plate whose centroid sits far from the cluster is a
-      candidate outlier — a systematic shift affecting the whole plate (illumination,
-      incubation, staining batch). Hover a point for its plate, well and compound; the
-      <b>deviation</b> score is the distance of a plate's centroid from the cohort centre
-      in PC space.
-    </div>
-    <div class="audit-row" style="margin-top:4px; color:var(--muted); font-size:0.78rem;">
-      This is a qualitative screen, not a verdict: the first two components capture only
-      part of the total variance (see the PC1 / PC2 percentages below), so a plate can drift
-      along axes not shown. A flagged well or plate also warrants care — it may reflect a
-      genuine phenotypic response to the perturbation rather than a technical artefact.
-      The section is hidden when there are fewer than 3 plates or 6 wells, where a PCA is not
-      meaningful.
-    </div>
-  </div>
-  <p class="section-note" id="pca-note"></p>
-  <div class="pca-controls" id="pca-controls">
-    <label><input type="checkbox" id="pca-show-wells" checked> Show individual wells</label>
-  </div>
-  <div id="pca-plot" style="width:100%; height:520px;"></div>
-</div>
-
 
 <!-- 7. IMAGE VIEWER (optional layer — activates when a CSV + TIFFs are loaded) -->
 <div class="section" id="imgviewer-section">

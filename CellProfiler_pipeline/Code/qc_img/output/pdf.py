@@ -26,8 +26,10 @@ from matplotlib.backends.backend_pdf import PdfPages
 
 # Page geometry (A4 landscape, inches).
 _PAGE_W, _PAGE_H = 11.69, 8.27
-_RED_KEYS = [("slope", "Slope"), ("medint", "MedInt"),
-             ("debris", "Debris"), ("low_density", "LowDensity")]
+# Failed-well counts per criterion at the DEFAULT thresholds (same rules as the HTML).
+_RED_KEYS = [("any", "Failed"), ("slope", "Blur"), ("medint", "MedianInt"),
+             ("debris", "Debris"), ("low_density", "LowCellDens"),
+             ("ratio", "Cells/Nuc"), ("cells", "CellCount")]
 
 
 def summary_pdf(payload: dict, output_path: Path) -> None:
@@ -134,7 +136,7 @@ def _plate_page(pdf: PdfPages, plate: str, d: dict, red_counts: dict) -> None:
         f"Pass: {d.get('n_pass', 0)}  ({d.get('pass_rate', 0):.1f}%)",
         f"Illum pass: {d.get('n_illum', 0)}",
         "",
-        "Red-well counts:",
+        "Failed wells by criterion (default thresholds):",
     ]
     for key, lbl in _RED_KEYS:
         lines.append(f"   {lbl}: {red_counts.get(key, {}).get(plate, 0)}")

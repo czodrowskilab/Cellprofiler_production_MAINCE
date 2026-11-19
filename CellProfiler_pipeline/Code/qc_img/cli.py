@@ -31,7 +31,7 @@ def parse_args() -> PipelineConfig:
     p.add_argument("--font", type=int, default=18)
     p.add_argument("--n-sigma", type=float, default=3.0)
     p.add_argument("--web-scale", type=float, default=0.2)
-    p.add_argument("--no-pdf", action="store_true", help="Omite el PDF resumen.")
+    p.add_argument("--no-pdf", action="store_true", help="Skip the summary PDF.")
     a = p.parse_args()
 
     # Dataset (canales/regex/geometría/cohort) desde el .env.

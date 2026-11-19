@@ -14,7 +14,7 @@ Payload keys (unchanged, frontend contract):
     n_rows, n_cols, data, countRanges,
     mfi{data,channels,colors,img}, radius,
     specs{slope,debris,low_density,medianInt},
-    madScores, redCounts, robustMetrics
+    madScores, redCounts, robustMetrics, thresholds, siteRefs, zNote, zCoverage
 """
 from __future__ import annotations
 
@@ -24,6 +24,8 @@ from qc import profiles
 from qc.render.collage import _make_report_collage
 from qc.render.overview import _collage_to_b64, _round_floats
 from qc.stats import scores as S
+from qc.stats import site_flags as SF
+from qc.stats import thresholds as T
 from qc.stats.colors import color_spec_payload
 
 # Fixed absolute colour scales for percentage heatmaps (verbatim from report.py).
@@ -45,6 +47,21 @@ def _cohort_range(col: str, plates_data: list, fallback_lo, fallback_hi,
     if len(vals) < 10:
         return fallback_lo, fallback_hi
     return float(np.percentile(vals, plo)), float(np.percentile(vals, phi))
+
+
+def _round_sig(obj, digits: int = 6):
+    """Redondeo a cifras SIGNIFICATIVAS (no a decimales fijos).
+
+    site_data alimenta el z robusto que el navegador recalcula: MedianIntensity
+    tiene valores pequeños y un redondeo a 3 decimales los distorsionaría.
+    """
+    if isinstance(obj, float):
+        return None if np.isnan(obj) else float(f"{obj:.{digits}g}")
+    if isinstance(obj, dict):
+        return {k: _round_sig(v, digits) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_round_sig(v, digits) for v in obj]
+    return obj
 
 
 def build_payload(cohort_name: str, plates_data: list[dict],
@@ -121,7 +138,7 @@ def build_payload(cohort_name: str, plates_data: list[dict],
                           if well in worst_sites and worst_sites[well] else {})}
                 for well, m in pqc.items()
             }),
-            "site_data": _round_floats({
+            "site_data": _round_sig({
                 well: {
                     str(field): {c: fvals.get(c) for c in html_cols if c in fvals}
                     for field, fvals in fields.items()
@@ -141,20 +158,33 @@ def build_payload(cohort_name: str, plates_data: list[dict],
     calc_mad_scores = {col: S.mad_scores(col, plates_data)[0]
                        for col in qc_cols_for_scores}
 
-    # ── Red well counts — from stats.scores ──────────────────────────────────
-    robust_red = {m: S.red_wells_zscore(m, channels, calc_mad_scores, plates_data)
-                  for m in profiles.ROBUST_METRICS}
-    from qc.stats.colors import ABSOLUTE_CUTS
-    r_p10_90_fail = ABSOLUTE_CUTS["Ratio_P10/P90"][1]  
-    r_p10_90_red_thresholds = {"Ratio_P10/P90": (None, r_p10_90_fail)}
+    # ── Referencias de z por perturbación + conteos por defecto ──────────────
+    # Se calculan desde plates_data con las claves de placa del payload, así que
+    # casan exactamente con DATA en el frontend. El navegador aplica sus propios
+    # thresholds sobre estas referencias; aquí solo se evalúan los DEFAULTS, para
+    # el PDF y como estado inicial coherente con el HTML.
+    site_qc = {pd_["name"]: (pd_.get("plate_qc_sites") or {}) for pd_ in plates_data}
+    cmap = {pd_["name"]: (pd_.get("plate_map") or {}) for pd_ in plates_data}
+    site_refs = SF.robust_site_refs(site_qc, profile, cmap)
+    z_cov = SF.z_coverage(site_qc, cmap, site_refs)
+
+    fam_counts = {k: {} for k in ("slope", "medint", "debris", "ldens",
+                                  "ratio", "cells", "any")}
+    for pname, wells in site_qc.items():
+        for k in fam_counts:
+            fam_counts[k][pname] = 0
+        for well, fields in wells.items():
+            fams = SF.well_family_failures(
+                fields, pname, SF.compound_of(cmap, pname, well), profile, site_refs)
+            for f in fams:
+                fam_counts[f][pname] += 1
+            if fams:
+                fam_counts["any"][pname] += 1
     red_counts = {
-        "slope":  robust_red["PowerLogLogSlope"],
-        "medint": robust_red["MedianIntensity"],
-        "debris": S.red_wells_absolute(
-            plates_data, [f"ImageQuality_PercentMaximal_{ch}" for ch in channels],
-            {f"ImageQuality_PercentMaximal_{ch}": (None, 1.0) for ch in channels}),
-        "low_density": S.red_wells_absolute(
-            plates_data, list(r_p10_90_red_thresholds.keys()), r_p10_90_red_thresholds),
+        "slope": fam_counts["slope"], "medint": fam_counts["medint"],
+        "debris": fam_counts["debris"], "low_density": fam_counts["ldens"],
+        "ratio": fam_counts["ratio"], "cells": fam_counts["cells"],
+        "any": fam_counts["any"],
     }
 
     # ── Heatmap colour specs — robust ones from stats.scores.median_colorscale
@@ -168,15 +198,15 @@ def build_payload(cohort_name: str, plates_data: list[dict],
                     "cs": cs(col)[0], "cmin": cs(col)[1], "cmax": cs(col)[2]}
                    for ch in channels
                    for col in [f"ImageQuality_PowerLogLogSlope_{ch}"]]
-    medianint_specs = [{"col": col, "title": f"MedianInt — {ch}",
+    medianint_specs = [{"col": col, "title": f"MedianIntensity — {ch}",
                         "cs": cs(col)[0], "cmin": cs(col)[1], "cmax": cs(col)[2]}
                        for ch in channels
                        for col in [f"ImageQuality_MedianIntensity_{ch}"]]
-    pct_max_specs = [{"col": col, "title": f"PctMaximal — {ch}",
+    pct_max_specs = [{"col": col, "title": f"PercentMaximal — {ch}",
                       "cmin": 0, "cmax": 2.0, "cs": _PCT_MAX_CS}
                      for ch in channels
                      for col in [f"ImageQuality_PercentMaximal_{ch}"]]
-    r_p10_p90_specs = [{"col": "Ratio_P10/P90", "title": "Low density — P10/P90"}]
+    r_p10_p90_specs = [{"col": "Ratio_P10/P90", "title": "Low cell density — P10/P90"}]
 
     count_ranges = {
         col: list(_cohort_range(col, plates_data, 0, None))
@@ -248,6 +278,10 @@ def build_payload(cohort_name: str, plates_data: list[dict],
         "colorSpec": color_spec_payload(
             [f"ImageQuality_{m}_" for m in profiles.ROBUST_METRICS]),
         "pca": pca_payload,
+        "thresholds": T.payload_spec(),
+        "siteRefs": SF.refs_payload(site_refs),
+        "zNote": SF.z_scope_note(z_cov),
+        "zCoverage": z_cov,
     }
 
 

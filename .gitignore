@@ -8,3 +8,4 @@ __pycache__
 variables.env
 Cellpose_seg/Code/sam-model/
 Examples/JUMP_MoA_QC_report.html
+./Images_publication/*

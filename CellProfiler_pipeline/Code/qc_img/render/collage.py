@@ -382,7 +382,7 @@ def make_report_footer(width: int, plate_name: str, plate_qc: dict,
 
         ic = profiles.COL_THRESHOLDS['COL_PASS'] if n_illum_p / max(n_wells, 1) >= 0.8 else \
              (profiles.COL_THRESHOLDS['COL_FAIL'] if n_illum_p / max(n_wells, 1) < 0.5 else (255, 190, 0))
-        line(f"  Illumination:  {n_illum_p}/{n_wells} pass ({pct(n_illum_p)})  [Slope + MaxInt]", ic, fb)
+        line(f"  Illumination:  {n_illum_p}/{n_wells} pass ({pct(n_illum_p)})  [Blur + MedianIntensity]", ic, fb)
         rule(); y += 4
 
         for grp_lbl, grp_col, grp_metrics in (
@@ -500,10 +500,20 @@ def make_report_footer(width: int, plate_name: str, plate_qc: dict,
 
         # Threshold reference
         line("  Thresholds applied:", (190, 205, 225), fs)
-        for mk, (lo, hi) in profiles.THRESHOLDS.items():
-            tstr = (f"> {lo}" if hi is None else f"< {hi}" if lo is None else f"{lo} to {hi}")
-            line(f"    {profiles.METRIC_LABELS.get(mk, mk)}: {tstr}", (150, 170, 195), fr)
-        line(f"  Adaptive: median ± {engine.n_sigma} σ (MAD) — per plate",
+        # Blur / MedianIntensity are judged by robust z-scores (not absolute cuts);
+        # the other lines are the default failure rules of qc.stats.thresholds.
+        from qc.stats import thresholds as _T
+        _d = _T.DEFAULTS
+        for txt in (
+            f"Blur: |z| > {_d['blur_z_fail']:g} vs plate or cohort (same perturbation)",
+            f"MedianIntensity: |z| > {_d['medint_z_fail']:g} vs plate or cohort (same perturbation)",
+            f"Debris: PercentMaximal > {_d['pctmax_fail']:g}",
+            f"Low cell density: Ratio P10/P90 > {_d['p1090_fail']:g}",
+            f"Cells/Nuclei ratio < {_d['ratio_min']:g}",
+            f"Cells < {_d['cells_site_min']:g} per site, < {_d['cells_well_min']:g} per well",
+        ):
+            line(f"    {txt}", (150, 170, 195), fr)
+        line(f"  Adaptive (non-robust metrics): median ± {engine.n_sigma} σ (MAD) — per plate",
              (150, 170, 195), fr)
         y += 16
         return y
@@ -597,8 +607,8 @@ def render_plate_collage(plate_name: str, montages: dict, plate_qc: dict,
     header = make_header(
         collage.shape[1],
         title=f"{plate_name}  \u00b7  Cell Painting QC  "
-              f"|  Slope range: {s_min:.2f} \u2013 {s_max:.2f}  "
-              f"|  Thresholds: absolute + {engine.n_sigma}\u03c3 MAD")
+              f"|  PowerLogLogSlope range: {s_min:.2f} \u2013 {s_max:.2f}  "
+              f"|  Blur/MedInt: robust z vs same perturbation")
     collage = np.concatenate([header, collage], axis=0)
 
     if plate_qc:

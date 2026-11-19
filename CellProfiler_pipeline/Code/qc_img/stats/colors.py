@@ -42,14 +42,18 @@ _PRIORITY = (RED, AMBER, GREEN)
 
 # Bandas de |z| para métricas robustas (Slope, MedInt). Coincide con MAD_BAND_CS
 # del front: verde |z|<=1, ambar 1<|z|<=3, rojo |z|>3.
-ZBAND_GREEN_MAX = 1.0
-ZBAND_AMBER_MAX = 3.0
+# Derivados de qc.stats.thresholds (fuente única); el reporte HTML los reemplaza
+# por los valores que el usuario edite en pantalla.
+from qc.stats import thresholds as _T
+
+ZBAND_GREEN_MAX = _T.DEFAULTS["blur_z_warn"]
+ZBAND_AMBER_MAX = _T.DEFAULTS["blur_z_fail"]
 
 # Cortes absolutos "ALTO = malo" (valor crudo, peor-sitio).
 # PercentMaximal: verde <0.1, ambar 0.1-1, rojo >1.
 ABSOLUTE_CUTS = {
-    "ImageQuality_PercentMaximal_": (0.1, 1.0),
-    "Ratio_P10/P90": (0.4, 0.5),
+    "ImageQuality_PercentMaximal_": (_T.DEFAULTS["pctmax_warn"], _T.DEFAULTS["pctmax_fail"]),
+    "Ratio_P10/P90": (_T.DEFAULTS["p1090_warn"], _T.DEFAULTS["p1090_fail"]),
 }
 
 

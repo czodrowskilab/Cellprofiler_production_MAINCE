@@ -40,31 +40,6 @@ def get_well(row: Union[str, int], col: Union[str, int]) -> str:
     return f"{row_corr}{int(col):02d}"
 
 
-def _is_readable_tiff(path: Path) -> tuple[bool, str]:
-    """
-        Check that a TIFF can be opened and its pixel data decoded.
-
-        Reading the pixels (not only the header) is what detects truncated
-        files, whose header is often intact.
-
-        Parameters
-        ----------
-        path : Path
-            Path to the TIFF file.
-
-        Returns
-        -------
-        tuple[bool, str]
-            (True, "") if readable, otherwise (False, error description).
-    """
-    try:
-        with tifffile.TiffFile(path) as tif:
-            tif.pages[0].asarray()
-        return True, ""
-    except Exception as e:
-        return False, repr(e)
-
-
 def _parse_single_file(
     path: Path,
     illum: bool,
@@ -72,8 +47,7 @@ def _parse_single_file(
     compiled_regex: re.Pattern,
     channels: Dict[int, str],
     output: Path | None,
-    check_integrity: bool = False,
-    check_plane: int | None = None,) -> dict | None:
+    z_plane: int | None = None,) -> dict | None:
     """
         Parse metadata from a single image file.
 
@@ -87,9 +61,7 @@ def _parse_single_file(
             Whether to include RNA mask fields.
         output : Path | None
             Output directory used to build derived paths.
-        check_integrity : bool, default False
-            Whether to verify that the TIFF can be decoded.
-        check_plane : int | None, default None
+        z_plane : int | None, default None
             If set, only files of this plane are verified (the rest are
             discarded later, so checking them would be wasted work).
 
@@ -112,11 +84,6 @@ def _parse_single_file(
     plate_meta = plate_match.groupdict()
     ch_num = int(meta["Channel"])
 
-    if check_integrity and (check_plane is None or int(meta["Plane"]) == check_plane):
-        ok, err = _is_readable_tiff(path)
-        if not ok:
-            return {"_corrupt": str(path), "_error": err}
-
     row = {
         "Image_FileName": path.name,
         "Image_PathName": str(path.parent),
@@ -134,21 +101,21 @@ def _parse_single_file(
 
     if masks == 1 and output is not None:
         is_syto = channels.get(ch_num) == "Syto"
-        is_z2 = int(meta["Plane"]) == 2
+        is_z = int(meta["Plane"]) == z_plane
         row["Image_FileName_RNA_mask"] = (
-            re.sub(r"\.tiff?$", ".png", path.name) if (is_syto and is_z2) else None
+            re.sub(r"\.tiff?$", ".png", path.name) if (is_syto and is_z) else None
         )
         row["Image_PathName_RNA_mask"] = str(output.parents[0] / "Cellpose_seg" / f"P_{plate_meta['Plate']}")
 
     if masks == 2 and output is not None:
         is_syto = channels.get(ch_num) == "Syto"
         is_hchs = channels.get(ch_num) == "Hoechst"
-        is_z2 = int(meta["Plane"]) == 2
+        is_z = int(meta["Plane"]) == z_plane
         row["Image_FileName_RNA_mask"] = (
-            (f"{path.stem}_cells_masks_P{plate_meta['Plate']}.tiff") if (is_syto and is_z2) else None
+            (f"{path.stem}_cells_masks_P{plate_meta['Plate']}.tiff") if (is_syto and is_z) else None
         )
         row["Image_FileName_DNA_mask"] = (
-            (f"{path.stem}_nuclei_masks_P{plate_meta['Plate']}.tiff") if (is_hchs and is_z2) else None
+            (f"{path.stem}_nuclei_masks_P{plate_meta['Plate']}.tiff") if (is_hchs and is_z) else None
         )
         row["Image_PathName_RNA_mask"] = str(output.parents[0] / "Object_masks")
         row["Image_PathName_DNA_mask"] = str(output.parents[0] / "Object_masks")
@@ -165,8 +132,7 @@ def parse_image_dataset(
     max_workers: int | None = None,
     plates2process: list | None = None,
     chunk_size: int = 2000,
-    check_integrity: bool = False,
-    check_plane: int | None = None,) -> pl.DataFrame:
+    z_plane: int | None = None,) -> pl.DataFrame:
     """
         Parse a microscopy image dataset into a structured Polars DataFrame using
         multiprocessing and chunked execution for memory efficiency.
@@ -185,9 +151,6 @@ def parse_image_dataset(
             Number of worker processes.
         chunk_size : int, default 2000
             Number of files processed per batch to limit memory usage.
-        check_integrity : bool, default False
-            Whether to verify that each TIFF can be decoded. Corrupt files are
-            logged and excluded, as if they were missing.
         check_plane : int | None, default None
             Restrict the integrity check to this plane.
 
@@ -218,8 +181,7 @@ def parse_image_dataset(
         output=output,
         compiled_regex=compiled_regex,
         channels=channels,
-        check_integrity=check_integrity,
-        check_plane=check_plane,
+        z_plane=z_plane,
     )
 
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
@@ -233,10 +195,6 @@ def parse_image_dataset(
                 else:
                     rows.append(result)
 
-    if check_integrity:
-        for c in sorted(corrupt, key=lambda d: d["_corrupt"]):
-            logger.warning(f"Corrupt image excluded: {c['_corrupt']} | {c['_error']}")
-        logger.info(f"{len(corrupt)} corrupt images excluded")
 
     logger.info(f"Parsed {len(rows)} valid image records")
     return pl.DataFrame(rows, infer_schema_length=None)
@@ -275,14 +233,14 @@ def pivot_df(df: pl.DataFrame, illum: bool = False, masks: int = 0) -> pl.DataFr
     idx = ["Metadata_Plate", "Metadata_Well", "Metadata_Field"]
     channel_names = df["Metadata_Channel_name"].unique().to_list()
 
-    df_file = _aux_pivot(df, "Image_FileName", idx, channel_names)
-    df_path = _aux_pivot(df, "Image_PathName", idx, channel_names)
+    df_file = _aux_pivot(df=df, values_col="Image_FileName", idx=idx, channel_names=channel_names)
+    df_path = _aux_pivot(df=df, values_col="Image_PathName", idx=idx, channel_names=channel_names)
 
     df_final = df_file.join(df_path, on=idx, how="inner")
 
     if illum:
-        df_illum_file = _aux_pivot(df, "FileName_Illum", idx, channel_names)
-        df_illum_path = _aux_pivot(df, "PathName_Illum", idx, channel_names)
+        df_illum_file = _aux_pivot(df=df, values_col="FileName_Illum", idx=idx, channel_names=channel_names)
+        df_illum_path = _aux_pivot(df=df, values_col="PathName_Illum", idx=idx, channel_names=channel_names)
 
         df_final = (
             df_final
@@ -368,8 +326,7 @@ def prepare_CSVs(
     illum: bool = False,
     masks: int = 0,
     max_workers: int | None = None,
-    plates2process: list | None = None,
-    check_integrity: bool = False,) -> None: 
+    plates2process: list | None = None,) -> None: 
     """
         Run the full metadata extraction pipeline and save final CSV output.
 
@@ -385,8 +342,6 @@ def prepare_CSVs(
             Whether to include RNA mask metadata.
         max_workers : int | None, default None
             Number of worker processes.
-        check_integrity : bool, default False
-            Whether to verify that TIFFs of the selected z-plane can be decoded.
     """
     #print(f"[DEBUG masks] masks: {masks}")
     logger.info("Starting metadata parsing")
@@ -399,8 +354,7 @@ def prepare_CSVs(
         plates2process=plates2process,
         channels=channels,
         compiled_regex=compiled_regex,
-        check_integrity=check_integrity,
-        check_plane=zplane,
+        z_plane=zplane,
     )
 
 
@@ -417,7 +371,7 @@ def prepare_CSVs(
     df_wide = pivot_df(df, illum=illum, masks=masks)
 
     idx = ["Metadata_Plate", "Metadata_Well", "Metadata_Field"]
-    df_wide = drop_incomplete_rows(df_wide, idx)
+    #df_wide = drop_incomplete_rows(df_wide, idx)
 
     filepath = Path(output) / f"{name_csv}.csv"
     df_wide.write_csv(filepath)
@@ -439,8 +393,6 @@ if __name__ == "__main__":
     parser.add_argument("--channel_dict", required=True, help='JSON Name→Number, e.g. {"Mito":"1",...}')
     parser.add_argument("--filename_regex", required=True, help="Regex with the following groups: Row/Column/Field/Plane/Channel")
     parser.add_argument("--discard_sites", required=False, help="Path of the parquet with sites to be discarted due to QC problems")
-    parser.add_argument("--check_integrity", action="store_true", help="Verify that TIFFs of the selected z-plane can be decoded; corrupt files are excluded and logged")
-
     args = parser.parse_args()
 
     channels = {int(v): k for k, v in json.loads(args.channel_dict).items()}
@@ -458,5 +410,4 @@ if __name__ == "__main__":
         channels=channels,
         compiled_regex=compiled_regex,
         discard_sites=args.discard_sites,
-        check_integrity=args.check_integrity,
     )

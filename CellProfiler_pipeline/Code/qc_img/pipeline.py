@@ -83,6 +83,11 @@ class QCPipeline:
         self.qc_sites: dict = {}
         self.qc: dict = {}
         self.platemap: dict = {}
+        self.compound_map: dict = {}
+        self.qc_worst_sites: dict = {}
+        self._robust_refs: dict = {}
+        self.robust_verdict: dict = {}
+        self._z_scope_note: str = ""
         self._mfi_sources: dict = {}
         self._channel_map: dict = {}
         self._mfi_img: dict = {}
@@ -110,18 +115,34 @@ class QCPipeline:
         # PctMaximal por máximo, Percentile_10 por mínimo (piso más bajo = fondo).
         self.qc, self.qc_worst_sites = collapse_sites_to_wells_with_sources(
             self.qc_sites, self.profile)
+        # Platemap primero: el z robusto necesita la perturbación de cada pozo.
+        # Explicit path, else first platemap_*.csv in input dir.
+        self.platemap = load_platemap(self.cfg.platemap, self.profile)
+        if not self.platemap:
+            candidates = sorted(self.input_dir.glob("platemap_*.csv"))
+            if candidates:
+                print(f"[platemap] Auto-detected: {candidates[0]}")
+                self.platemap = load_platemap(candidates[0], self.profile)
+
+        # {plate (clave de qc_sites): {well: perturbación}}. Vacío sin platemap →
+        # todos los pozos comparten la perturbación "" (z contra placa/cohorte completas).
+        self.compound_map = {
+            p: self._lookup_plate(self.platemap, p, "platemap")
+            for p in self.qc_sites} if self.platemap else {}
+
         # Veredicto robusto (Slope, MedInt) por pozo = peor sitio, con z robusto por
-        # sitio (doble guardia placa/cohorte, 3σ Slope / 5σ MedInt). Fuente ÚNICA
-        # para el color de estas métricas en collage/overview (reemplaza el umbral
-        # absoluto obsoleto). floored_note avisa si alguna placa usó piso de MAD.
+        # sitio calculado SOLO contra pozos de la misma perturbación (doble guardia
+        # placa/cohorte; cortes por defecto de qc.stats.thresholds). Fuente de los
+        # bordes del collage/overview PNG y del parquet de sitios fallidos.
         from qc.stats.site_flags import (well_robust_verdict, robust_site_refs,
-                                         floored_note)
-        self._robust_refs = robust_site_refs(self.qc_sites, self.profile)
+                                         z_coverage, z_scope_note)
+        self._robust_refs = robust_site_refs(
+            self.qc_sites, self.profile, self.compound_map)
         self.robust_verdict = well_robust_verdict(
-            self.qc_sites, self.profile, self._robust_refs)
-        self._robust_floored_note = floored_note(self._robust_refs)
-        if self._robust_floored_note:
-            print(f"[info] {self._robust_floored_note}")
+            self.qc_sites, self.profile, self._robust_refs, self.compound_map)
+        self._z_scope_note = z_scope_note(
+            z_coverage(self.qc_sites, self.compound_map, self._robust_refs))
+        print(f"[info] {self._z_scope_note}")
 
         # MFI (single read of Cells/Nuclei), image-level MFI, radius (all plates).
         self._mfi_sources, self._channel_map = self.store.mfi_sources()
@@ -129,13 +150,6 @@ class QCPipeline:
         self._mfi_site_table = self.store.mfi_site_table()
         self._radius_all = self.store.radius_all_plates()
 
-        # Platemap: explicit path, else first platemap_*.csv in input dir.
-        self.platemap = load_platemap(self.cfg.platemap, self.profile)
-        if not self.platemap:
-            candidates = sorted(self.input_dir.glob("platemap_*.csv"))
-            if candidates:
-                print(f"[platemap] Auto-detected: {candidates[0]}")
-                self.platemap = load_platemap(candidates[0], self.profile)
         return self
 
     # ── Stage 2: render ──────────────────────────────────────────────────────
@@ -187,7 +201,8 @@ class QCPipeline:
             from qc.stats.site_flags import write_flagged_sites_parquet
             fq_name = f"{self.cfg.cohort_name}_flagged_sites.parquet"
             n = write_flagged_sites_parquet(
-                self.qc_sites, self.profile, self.output_path / fq_name)
+                self.qc_sites, self.profile, self.output_path / fq_name,
+                compound_map=self.compound_map, robust_refs=self._robust_refs)
             print(f"[info] Flagged-sites parquet: {n} site(s) → {fq_name}")
         except Exception as e:
             print(f"[warn] Flagged-sites parquet skipped: {e}")

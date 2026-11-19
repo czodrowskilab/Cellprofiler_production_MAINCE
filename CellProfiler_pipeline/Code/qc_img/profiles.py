@@ -40,7 +40,7 @@ CHANNEL_LABELS = {"Hoechst": "Hoechst", "Syto": "Sy", "Golgi": "Go",
 CHANNEL_COLORS = {"Hoechst": (100, 160, 255), "Syto": (80, 220, 120),
                   "Golgi": (255, 180, 60), "ER": (180, 90, 255),
                   "Mito": (255, 80, 80), "Brightfield": (160, 160, 160)}
-METRIC_LABELS  = {"PowerLogLogSlope": "Focus", "MedianIntensity": "MaxInt"}
+METRIC_LABELS  = {"PowerLogLogSlope": "Blur", "MedianIntensity": "MedInt"}
 
 COUNT_COLS = {"Raw": "Count_Raw_nuclei", "Filtered": "Count_Nuclei",
               "Cells": "Count_Cells", "Artifacts": "Count_Illum_artifacts_filtered"}

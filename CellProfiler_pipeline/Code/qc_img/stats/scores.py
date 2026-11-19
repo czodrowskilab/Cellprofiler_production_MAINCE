@@ -14,48 +14,76 @@ from __future__ import annotations
 import polars as pl
 
 from qc.stats import expressions as X
+from qc.stats import thresholds as T
 
 _MAD_TO_SIGMA = 1.4826
 
 
 def _long_frame(plates_data: list, col: str) -> pl.DataFrame:
-    """Aplana plates_data a [plate, well, value] para una columna, sin nulls/NaN."""
+    """Aplana plates_data a [plate, well, cmpd, value] para una columna, sin nulls/NaN.
+
+    cmpd es la perturbación del pozo según plate_map ('' si no hay platemap o el
+    pozo no está mapeado).
+    """
     rows = []
     for pd_ in plates_data:
         pname = pd_["name"]
+        pmap = pd_.get("plate_map") or {}
         for well, m in pd_["plate_qc"].items():
             v = m.get(col)
             if v is not None and not (isinstance(v, float) and v != v):
-                rows.append((pname, well, float(v)))
+                rows.append((pname, well, pmap.get(well, "") or "", float(v)))
     if not rows:
-        return pl.DataFrame(schema={"plate": pl.Utf8, "well": pl.Utf8, "value": pl.Float64})
-    return pl.DataFrame(rows, schema=["plate", "well", "value"], orient="row")
+        return pl.DataFrame(schema={"plate": pl.Utf8, "well": pl.Utf8,
+                                    "cmpd": pl.Utf8, "value": pl.Float64})
+    return pl.DataFrame(rows, schema=["plate", "well", "cmpd", "value"], orient="row")
 
 
 def mad_scores(col: str, plates_data: list) -> tuple[dict, float | None, float | None]:
     """Por well: valor + z contra placa (z_pl) y contra cohorte (z_co).
 
-    Réplica de _mad_scores. Cohort median/MAD en un agg global; plate median/MAD
-    con group_by(plate); z vectorizado. Salida idéntica (dict + redondeos).
+    El z se calcula SOLO contra pozos que comparten la misma perturbación:
+      · z_pl → misma placa + misma perturbación
+      · z_co → todas las placas + misma perturbación
+    Un grupo con menos de MIN_GROUP_WELLS pozos no produce z (se devuelve None
+    para esa mitad). Sin platemap todos los pozos comparten la perturbación ''
+    y el cálculo equivale al anterior (placa completa / cohorte completa).
+
+    Cada entrada incluye n_pl / n_co (tamaño del grupo de referencia). Los dos
+    últimos valores devueltos son mediana/MAD de TODOS los pozos (informativos).
     """
     df = _long_frame(plates_data, col)
     if df.height < 4:
         return {}, None, None
 
-    coh_med = float(df["value"].median())
-    coh_mad = float((df["value"] - coh_med).abs().median()) or 1.0
+    g_med = float(df["value"].median())
+    g_mad = float((df["value"] - g_med).abs().median()) or 1.0
 
-    # median/MAD por placa en una pasada; join de vuelta.
-    per_plate = df.group_by("plate").agg(
+    min_n = T.MIN_GROUP_WELLS
+
+    # Referencia de cohorte: por perturbación (todas las placas).
+    per_cohort = df.group_by("cmpd").agg(
+        pl.col("value").median().alias("_cmed"),
+        (pl.col("value") - pl.col("value").median()).abs().median().alias("_cmad"),
+        pl.len().alias("n_co"),
+    )
+    # Referencia de placa: por (placa, perturbación).
+    per_plate = df.group_by(["plate", "cmpd"]).agg(
         pl.col("value").median().alias("_pmed"),
         (pl.col("value") - pl.col("value").median()).abs().median().alias("_pmad"),
+        pl.len().alias("n_pl"),
     )
-    df = df.join(per_plate, on="plate")
+    df = df.join(per_cohort, on="cmpd").join(per_plate, on=["plate", "cmpd"])
     df = df.with_columns(
-        pl.when(pl.col("_pmad") == 0).then(1.0).otherwise(pl.col("_pmad")).alias("_pmad")
+        pl.when(pl.col("_pmad") == 0).then(1.0).otherwise(pl.col("_pmad")).alias("_pmad"),
+        pl.when(pl.col("_cmad") == 0).then(1.0).otherwise(pl.col("_cmad")).alias("_cmad"),
     ).with_columns(
-        ((pl.col("value") - pl.col("_pmed")) / pl.col("_pmad")).round(2).alias("z_pl"),
-        ((pl.col("value") - coh_med) / coh_mad).round(2).alias("z_co"),
+        pl.when(pl.col("n_pl") >= min_n)
+          .then(((pl.col("value") - pl.col("_pmed")) / pl.col("_pmad")).round(2))
+          .otherwise(None).alias("z_pl"),
+        pl.when(pl.col("n_co") >= min_n)
+          .then(((pl.col("value") - pl.col("_cmed")) / pl.col("_cmad")).round(2))
+          .otherwise(None).alias("z_co"),
         pl.col("value").round(5).alias("v"),
     )
 
@@ -63,8 +91,9 @@ def mad_scores(col: str, plates_data: list) -> tuple[dict, float | None, float |
     for row in df.iter_rows(named=True):
         scores.setdefault(row["plate"], {})[row["well"]] = {
             "v": row["v"], "z_pl": row["z_pl"], "z_co": row["z_co"],
+            "n_pl": row["n_pl"], "n_co": row["n_co"],
         }
-    return scores, round(coh_med, 5), round(coh_mad, 5)
+    return scores, round(g_med, 5), round(g_mad, 5)
 
 
 def median_colorscale(col: str, plates_data: list) -> tuple:
@@ -136,7 +165,7 @@ def red_wells_zscore(metric: str, channels: list, mad_score_cache: dict,
             for ch in channels:
                 col = f"ImageQuality_{metric}_{ch}"
                 sc = mad_score_cache.get(col, {}).get(pname, {}).get(well)
-                if sc and abs(sc["z_co"]) > z_thresh:
+                if sc and sc.get("z_co") is not None and abs(sc["z_co"]) > z_thresh:
                     count += 1
                     break
         result[pname] = count
